@@ -118,6 +118,9 @@ class GridState:
     def clear_auto_pending(self):
         self.data["auto_trade"] = copy.deepcopy(DEFAULT_STATE["auto_trade"])
 
+    def reset_alerts_for_current_level(self):
+        self._reset_alerts_for_level(self.level_state)
+
     def pending_confirmed(self, current_level, current_direction):
         pending = self.data.get("auto_trade", {})
         if not pending.get("pending_action"):

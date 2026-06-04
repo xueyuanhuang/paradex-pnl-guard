@@ -274,6 +274,8 @@ def should_send(state, alert_key, repeat_interval_seconds):
 def send_and_mark(notifier, state, alert_key, total_pnl, positions, action_details):
     if notifier.send_grid_alert(alert_key, total_pnl, state, positions, action_details):
         state.mark_alert(alert_key)
+        return True
+    return False
 
 
 def error_detail(exc):
@@ -320,6 +322,45 @@ def mark_prices_from_positions(positions):
     return marks
 
 
+def mark_prices_from_bbo(quotes):
+    marks = {}
+    for market, quote in quotes.items():
+        bid = _to_float(quote.get("bid"))
+        ask = _to_float(quote.get("ask"))
+        if market in (BTC_MARKET, ETH_MARKET) and bid > 0 and ask > 0:
+            marks[market] = (bid + ask) / 2
+    return marks
+
+
+def bbo_total_pnl(positions, quotes):
+    total = 0.0
+    seen = 0
+
+    for p in positions:
+        market = p.get("market")
+        if market not in (BTC_MARKET, ETH_MARKET):
+            continue
+
+        quote = quotes.get(market, {})
+        side = p.get("side")
+        size = abs(_to_float(p.get("size")))
+        entry = _to_float(p.get("average_entry_price"))
+        bid = _to_float(quote.get("bid"))
+        ask = _to_float(quote.get("ask"))
+        if not size or not entry or not bid or not ask:
+            return None
+
+        if side == "LONG":
+            total += size * (bid - entry)
+        elif side == "SHORT":
+            total += size * (entry - ask)
+        else:
+            return None
+        seen += 1
+
+    return total if seen else None
+
+
 def expected_after_action(action_key, state):
     mapping = {
         "L2_open": ("L1_L2", state.direction),
@@ -331,9 +372,9 @@ def expected_after_action(action_key, state):
     return mapping[action_key]
 
 
-def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size):
+def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size, price_marks=None):
     prefix = f"{action_key}-{int(time.time())}"
-    marks = mark_prices_from_positions(positions)
+    marks = price_marks or mark_prices_from_positions(positions)
 
     if action_key == "L3_close":
         return trader.close_lot_orders("L3", lot_snapshot, state.direction, prefix)
@@ -354,9 +395,9 @@ def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_
     raise RuntimeError(f"Unsupported auto action: {action_key}")
 
 
-def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, action_details, lot_snapshot, asset_size):
+def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, action_details, lot_snapshot, asset_size, price_marks=None):
     expected_level, expected_direction = expected_after_action(action_key, state)
-    orders = build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size)
+    orders = build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size, price_marks)
     order_text = trader.describe_orders(orders)
 
     notifier.send_trade_notice(
@@ -385,7 +426,7 @@ def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions
             ],
         )
         state.mark_alert(action_key)
-        return
+        return True
 
     client_ids = [order.client_id for order in orders]
     state.mark_auto_pending(action_key, expected_level, expected_direction, client_ids)
@@ -406,11 +447,12 @@ def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions
             f"Result: {result_text}",
         ],
     )
+    return True
 
 
-def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positions, details, asset_size, repeat_interval):
+def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positions, details, asset_size, repeat_interval, price_marks=None):
     if not should_send(state, action_key, repeat_interval):
-        return
+        return False
 
     needs_lot = action_key in {"L1_TP", "L2_close", "L3_close"}
     lot_snapshot = build_lot_snapshot(client, positions, state.level_state, state.direction) if needs_lot else {
@@ -419,9 +461,8 @@ def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positio
     }
 
     if trader.enabled:
-        submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size)
-    else:
-        send_and_mark(notifier, state, action_key, total_pnl, positions, details)
+        return submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size, price_marks)
+    return send_and_mark(notifier, state, action_key, total_pnl, positions, details)
 
 
 def signal_handler(sig, frame):
@@ -434,6 +475,7 @@ def cmd_monitor(args):
     from notifier import TelegramNotifier
     from state import GridState
     from trader import AutoTrader
+    from ws_feed import BboFeed
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -453,49 +495,85 @@ def cmd_monitor(args):
     state = GridState()
     trader = AutoTrader(logger)
     thresholds = compute_thresholds(args.asset)
+    bbo_feed = None
+    if args.ws_bbo:
+        bbo_feed = BboFeed([BTC_MARKET, ETH_MARKET], logger=logger)
+        bbo_feed.start()
 
     logger.info(f"Grid Monitor started | Asset: ${args.asset} | Interval: {args.interval}s")
     logger.info(f"Thresholds: {thresholds}")
     logger.info(f"Auto trade mode: {trader.mode_label()}")
+    logger.info(f"WS BBO trigger: {'enabled' if bbo_feed else 'disabled'}")
+
+    positions = None
+    rest_total_pnl = 0.0
+    last_rest_sync = 0.0
+    last_log = 0.0
+    last_state_save = 0.0
 
     while True:
         try:
-            start = time.time()
+            if bbo_feed:
+                bbo_feed.wait_for_update(args.ws_wait_timeout)
+            elif positions is not None:
+                time.sleep(args.interval)
 
-            # Poll Telegram /pnl commands
-            for cmd in notifier.poll_commands():
-                if cmd == "pnl":
-                    pos = client.get_open_positions()
-                    if pos is not None:
-                        pnl = sum(float(p.get("unrealized_pnl", 0)) for p in pos)
-                        notifier.send_pnl_report(pnl, pos, state)
+            now = time.time()
+            rest_due = (
+                positions is None
+                or now - last_rest_sync >= args.interval
+                or (state.pending_action and now - last_rest_sync >= args.pending_check_interval)
+            )
 
-            # Fetch positions
-            positions = client.get_open_positions()
+            if rest_due:
+                for cmd in notifier.poll_commands():
+                    if cmd == "pnl":
+                        pos = client.get_open_positions()
+                        if pos is not None:
+                            pnl = sum(float(p.get("unrealized_pnl", 0)) for p in pos)
+                            notifier.send_pnl_report(pnl, pos, state)
+
+                fresh_positions = client.get_open_positions()
+                if fresh_positions is None:
+                    if positions is None:
+                        time.sleep(5)
+                        continue
+                else:
+                    positions = fresh_positions
+                    rest_total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
+                    last_rest_sync = now
+
+                    notify_stablecoin_transfers(client, notifier, state)
+
+                    detected_level, detected_dir = detect_grid_level(positions, args.asset)
+                    if detected_level != state.level_state:
+                        old = state.level_state
+                        state.transition_to(detected_level, detected_dir)
+                        logger.info(f"Level change: {old} -> {detected_level}")
+                        if detected_level == "FLAT" and old != "FLAT":
+                            notifier.send_grid_alert("flat", 0, state, [], build_open_details("flat", args.asset, state))
+
+                    if detected_dir != 0 and detected_dir != state.direction:
+                        state.data["direction"] = detected_dir
+
             if positions is None:
-                time.sleep(5)
                 continue
 
-            notify_stablecoin_transfers(client, notifier, state)
-
-            total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
-
-            # Auto-detect level from actual positions
-            detected_level, detected_dir = detect_grid_level(positions, args.asset)
-
-            if detected_level != state.level_state:
-                old = state.level_state
-                state.transition_to(detected_level, detected_dir)
-                logger.info(f"Level change: {old} -> {detected_level}")
-                if detected_level == "FLAT" and old != "FLAT":
-                    notifier.send_grid_alert("flat", 0, state, [], build_open_details("flat", args.asset, state))
-
-            if detected_dir != 0 and detected_dir != state.direction:
-                state.data["direction"] = detected_dir
+            quotes = bbo_feed.snapshot() if bbo_feed else {}
+            ws_ready = bool(bbo_feed and bbo_feed.ready() and not bbo_feed.stale(args.ws_stale_after))
+            ws_total_pnl = bbo_total_pnl(positions, quotes) if ws_ready else None
+            total_pnl = ws_total_pnl if ws_total_pnl is not None else rest_total_pnl
+            pnl_source = "WS_BBO" if ws_total_pnl is not None else "REST"
+            price_marks = mark_prices_from_bbo(quotes) if ws_total_pnl is not None else None
 
             state.update_pnl(total_pnl)
 
-            logger.info(f"PnL: {total_pnl:+.2f} | State: {state.level_state} | Dir: {state.direction_label}")
+            if now - last_log >= args.log_interval or rest_due:
+                logger.info(
+                    f"PnL: {total_pnl:+.2f} ({pnl_source}) | "
+                    f"REST: {rest_total_pnl:+.2f} | State: {state.level_state} | Dir: {state.direction_label}"
+                )
+                last_log = now
 
             if state.pending_action:
                 if state.pending_confirmed(state.level_state, state.direction):
@@ -509,6 +587,9 @@ def cmd_monitor(args):
                         ],
                     )
                     state.clear_auto_pending()
+                    state.reset_alerts_for_current_level()
+                    state.save()
+                    last_state_save = now
                 elif state.pending_stale(args.pending_timeout):
                     pending = state.pending_action
                     notifier.send_trade_notice(
@@ -522,48 +603,62 @@ def cmd_monitor(args):
                     )
                     state.clear_auto_pending()
                     state.save()
-                    elapsed = time.time() - start
-                    time.sleep(max(0, args.interval - elapsed))
+                    last_state_save = now
                     continue
                 else:
-                    state.save()
-                    elapsed = time.time() - start
-                    time.sleep(max(0, args.interval - elapsed))
+                    if now - last_state_save >= args.state_save_interval:
+                        state.save()
+                        last_state_save = now
                     continue
 
             # --- Grid threshold checks ---
             ls = state.level_state
+            acted = False
 
             if ls == "L1":
                 if total_pnl >= thresholds["L1_TP"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L1_TP", lot_snapshot, state, args.asset)
-                    act_or_alert(trader, notifier, state, client, "L1_TP", total_pnl, positions, details, args.asset, args.repeat_interval)
-                if total_pnl <= thresholds["L2_open"]:
+                    acted = act_or_alert(
+                        trader, notifier, state, client, "L1_TP", total_pnl, positions,
+                        details, args.asset, args.repeat_interval, price_marks
+                    )
+                elif total_pnl <= thresholds["L2_open"]:
                     details = build_open_details("L2_open", args.asset, state)
-                    act_or_alert(trader, notifier, state, client, "L2_open", total_pnl, positions, details, args.asset, args.repeat_interval)
+                    acted = act_or_alert(
+                        trader, notifier, state, client, "L2_open", total_pnl, positions,
+                        details, args.asset, args.repeat_interval, price_marks
+                    )
 
             elif ls == "L1_L2":
                 if total_pnl >= thresholds["L2_close"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L2_close", lot_snapshot, state, args.asset)
-                    act_or_alert(trader, notifier, state, client, "L2_close", total_pnl, positions, details, args.asset, args.repeat_interval)
-                if total_pnl <= thresholds["L3_open"]:
+                    acted = act_or_alert(
+                        trader, notifier, state, client, "L2_close", total_pnl, positions,
+                        details, args.asset, args.repeat_interval, price_marks
+                    )
+                elif total_pnl <= thresholds["L3_open"]:
                     details = build_open_details("L3_open", args.asset, state)
-                    act_or_alert(trader, notifier, state, client, "L3_open", total_pnl, positions, details, args.asset, args.repeat_interval)
+                    acted = act_or_alert(
+                        trader, notifier, state, client, "L3_open", total_pnl, positions,
+                        details, args.asset, args.repeat_interval, price_marks
+                    )
 
             elif ls == "L1_L2_L3":
                 if total_pnl >= thresholds["L3_close"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L3_close", lot_snapshot, state, args.asset)
-                    act_or_alert(trader, notifier, state, client, "L3_close", total_pnl, positions, details, args.asset, args.repeat_interval)
-                if total_pnl <= thresholds["warning"] and should_send(state, "warning", args.repeat_interval):
-                    send_and_mark(notifier, state, "warning", total_pnl, positions, "")
+                    acted = act_or_alert(
+                        trader, notifier, state, client, "L3_close", total_pnl, positions,
+                        details, args.asset, args.repeat_interval, price_marks
+                    )
+                elif total_pnl <= thresholds["warning"] and should_send(state, "warning", args.repeat_interval):
+                    acted = send_and_mark(notifier, state, "warning", total_pnl, positions, "")
 
-            state.save()
-
-            elapsed = time.time() - start
-            time.sleep(max(0, args.interval - elapsed))
+            if acted or now - last_state_save >= args.state_save_interval:
+                state.save()
+                last_state_save = now
 
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
@@ -599,6 +694,13 @@ def main():
     p_mon.add_argument("--asset", type=float, default=1000, help="Asset size in USD for threshold scaling (default: 1000)")
     p_mon.add_argument("--repeat-interval", type=int, default=600, help="Repeat actionable alerts every N seconds until state changes (default: 600)")
     p_mon.add_argument("--pending-timeout", type=int, default=180, help="Seconds to wait for a submitted action to change state (default: 180)")
+    p_mon.add_argument("--ws-bbo", dest="ws_bbo", action="store_true", default=True, help="Use websocket BBO as primary trigger source (default)")
+    p_mon.add_argument("--no-ws-bbo", dest="ws_bbo", action="store_false", help="Disable websocket BBO trigger source")
+    p_mon.add_argument("--ws-wait-timeout", type=float, default=1.0, help="Max seconds to wait for a websocket price update per loop (default: 1)")
+    p_mon.add_argument("--ws-stale-after", type=float, default=10.0, help="Fallback to REST PnL if websocket is stale for N seconds (default: 10)")
+    p_mon.add_argument("--pending-check-interval", type=float, default=5.0, help="REST position check interval while an action is pending (default: 5)")
+    p_mon.add_argument("--log-interval", type=float, default=30.0, help="Log PnL at most every N seconds unless REST sync runs (default: 30)")
+    p_mon.add_argument("--state-save-interval", type=float, default=30.0, help="Save state at least every N seconds (default: 30)")
     p_mon.set_defaults(func=cmd_monitor)
 
     p = sub.add_parser("status", help="Show current state")
