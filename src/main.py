@@ -18,6 +18,7 @@ logger = logging.getLogger("GridMonitor")
 BTC_MARKET = "BTC-USD-PERP"
 ETH_MARKET = "ETH-USD-PERP"
 LEVEL_ORDER = ["L1", "L2", "L3"]
+STABLECOIN_TOKENS = {"USDC", "USDT", "DAI", "USDP", "TUSD"}
 
 
 def _to_float(value, default=0.0):
@@ -275,6 +276,154 @@ def send_and_mark(notifier, state, alert_key, total_pnl, positions, action_detai
         state.mark_alert(alert_key)
 
 
+def error_detail(exc):
+    text = str(exc)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        body = getattr(response, "text", "")
+        if body:
+            if len(body) > 800:
+                body = body[:800] + "..."
+            text = f"{text}\nResponse: {body}"
+    return text
+
+
+def is_stablecoin_transfer(transfer):
+    token = str(transfer.get("token", "")).upper()
+    return token in STABLECOIN_TOKENS
+
+
+def notify_stablecoin_transfers(client, notifier, state):
+    transfers = client.get_transfers(page_size=20)
+    if transfers is None:
+        return
+
+    stable_transfers = [t for t in transfers if is_stablecoin_transfer(t)]
+    if not state.stablecoin_transfers_initialized:
+        state.seed_stablecoin_transfers(stable_transfers)
+        return
+
+    for transfer in reversed(stable_transfers):
+        if state.transfer_notice_due(transfer) and notifier.send_stablecoin_notice(transfer):
+            state.mark_transfer_seen(transfer)
+
+
+def mark_prices_from_positions(positions):
+    marks = {}
+    for p in positions:
+        market = p.get("market")
+        size = _to_float(p.get("size"))
+        entry = _to_float(p.get("average_entry_price"))
+        pnl = _to_float(p.get("unrealized_pnl"))
+        if market in (BTC_MARKET, ETH_MARKET) and size:
+            marks[market] = entry + pnl / size
+    return marks
+
+
+def expected_after_action(action_key, state):
+    mapping = {
+        "L2_open": ("L1_L2", state.direction),
+        "L3_open": ("L1_L2_L3", state.direction),
+        "L3_close": ("L1_L2", state.direction),
+        "L2_close": ("L1", state.direction),
+        "L1_TP": ("L1", -state.direction if state.direction else 0),
+    }
+    return mapping[action_key]
+
+
+def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size):
+    prefix = f"{action_key}-{int(time.time())}"
+    marks = mark_prices_from_positions(positions)
+
+    if action_key == "L3_close":
+        return trader.close_lot_orders("L3", lot_snapshot, state.direction, prefix)
+    if action_key == "L2_close":
+        return trader.close_lot_orders("L2", lot_snapshot, state.direction, prefix)
+    if action_key == "L2_open":
+        btc_notional, eth_notional = scaled_open_notional("L2_open", asset_size)
+        return trader.open_notional_orders("L2", btc_notional, eth_notional, marks, state.direction, prefix)
+    if action_key == "L3_open":
+        btc_notional, eth_notional = scaled_open_notional("L3_open", asset_size)
+        return trader.open_notional_orders("L3", btc_notional, eth_notional, marks, state.direction, prefix)
+    if action_key == "L1_TP":
+        orders = trader.close_lot_orders("L1", lot_snapshot, state.direction, prefix)
+        btc_notional, eth_notional = scaled_open_notional("L1_TP", asset_size)
+        orders.extend(trader.open_notional_orders("L1", btc_notional, eth_notional, marks, -state.direction, prefix))
+        return orders
+
+    raise RuntimeError(f"Unsupported auto action: {action_key}")
+
+
+def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, action_details, lot_snapshot, asset_size):
+    expected_level, expected_direction = expected_after_action(action_key, state)
+    orders = build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size)
+    order_text = trader.describe_orders(orders)
+
+    notifier.send_trade_notice(
+        f"🤖 自动执行准备: {action_key}",
+        [
+            f"Mode: {trader.mode_label()}",
+            f"Total PnL: {total_pnl:+.2f} USDC",
+            "",
+            action_details,
+            "",
+            "订单:",
+            order_text,
+        ],
+    )
+
+    try:
+        result = trader.submit_batch(orders)
+    except Exception as e:
+        detail = error_detail(e)
+        logger.error(f"Auto execution failed for {action_key}: {detail}")
+        notifier.send_trade_notice(
+            f"❌ 自动执行失败: {action_key}",
+            [
+                f"Error: {detail}",
+                "本次没有记录 pending，下次到提醒间隔后会再尝试。",
+            ],
+        )
+        state.mark_alert(action_key)
+        return
+
+    client_ids = [order.client_id for order in orders]
+    state.mark_auto_pending(action_key, expected_level, expected_direction, client_ids)
+    state.mark_alert(action_key)
+    result_text = str(result)
+    if len(result_text) > 1200:
+        result_text = result_text[:1200] + "..."
+
+    notifier.send_trade_notice(
+        f"✅ 自动执行已提交: {action_key}",
+        [
+            f"等待确认状态: {expected_level}",
+            f"Client IDs: {', '.join(client_ids)}",
+            "",
+            "订单:",
+            order_text,
+            "",
+            f"Result: {result_text}",
+        ],
+    )
+
+
+def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positions, details, asset_size, repeat_interval):
+    if not should_send(state, action_key, repeat_interval):
+        return
+
+    needs_lot = action_key in {"L1_TP", "L2_close", "L3_close"}
+    lot_snapshot = build_lot_snapshot(client, positions, state.level_state, state.direction) if needs_lot else {
+        "source": "not_required",
+        "lots": {},
+    }
+
+    if trader.enabled:
+        submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size)
+    else:
+        send_and_mark(notifier, state, action_key, total_pnl, positions, details)
+
+
 def signal_handler(sig, frame):
     logger.info("Shutting down...")
     sys.exit(0)
@@ -284,6 +433,7 @@ def cmd_monitor(args):
     from paradex import ParadexClient
     from notifier import TelegramNotifier
     from state import GridState
+    from trader import AutoTrader
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -301,10 +451,12 @@ def cmd_monitor(args):
     client = ParadexClient(jwt)
     notifier = TelegramNotifier(tg_token, tg_chat)
     state = GridState()
+    trader = AutoTrader(logger)
     thresholds = compute_thresholds(args.asset)
 
     logger.info(f"Grid Monitor started | Asset: ${args.asset} | Interval: {args.interval}s")
     logger.info(f"Thresholds: {thresholds}")
+    logger.info(f"Auto trade mode: {trader.mode_label()}")
 
     while True:
         try:
@@ -323,6 +475,8 @@ def cmd_monitor(args):
             if positions is None:
                 time.sleep(5)
                 continue
+
+            notify_stablecoin_transfers(client, notifier, state)
 
             total_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
 
@@ -343,32 +497,66 @@ def cmd_monitor(args):
 
             logger.info(f"PnL: {total_pnl:+.2f} | State: {state.level_state} | Dir: {state.direction_label}")
 
+            if state.pending_action:
+                if state.pending_confirmed(state.level_state, state.direction):
+                    pending = state.pending_action
+                    notifier.send_trade_notice(
+                        f"✅ 自动执行已确认: {pending}",
+                        [
+                            f"当前状态: {state.level_state}",
+                            f"方向: {state.direction_label}",
+                            f"Total PnL: {total_pnl:+.2f} USDC",
+                        ],
+                    )
+                    state.clear_auto_pending()
+                elif state.pending_stale(args.pending_timeout):
+                    pending = state.pending_action
+                    notifier.send_trade_notice(
+                        f"⚠️ 自动执行未确认: {pending}",
+                        [
+                            f"超过 {args.pending_timeout}s 后状态仍未达到预期。",
+                            "已解除 pending，下一次达到提醒间隔会重新评估/重试。",
+                            f"当前状态: {state.level_state}",
+                            f"方向: {state.direction_label}",
+                        ],
+                    )
+                    state.clear_auto_pending()
+                    state.save()
+                    elapsed = time.time() - start
+                    time.sleep(max(0, args.interval - elapsed))
+                    continue
+                else:
+                    state.save()
+                    elapsed = time.time() - start
+                    time.sleep(max(0, args.interval - elapsed))
+                    continue
+
             # --- Grid threshold checks ---
             ls = state.level_state
 
             if ls == "L1":
-                if total_pnl >= thresholds["L1_TP"] and should_send(state, "L1_TP", args.repeat_interval):
+                if total_pnl >= thresholds["L1_TP"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L1_TP", lot_snapshot, state, args.asset)
-                    send_and_mark(notifier, state, "L1_TP", total_pnl, positions, details)
-                if total_pnl <= thresholds["L2_open"] and should_send(state, "L2_open", args.repeat_interval):
+                    act_or_alert(trader, notifier, state, client, "L1_TP", total_pnl, positions, details, args.asset, args.repeat_interval)
+                if total_pnl <= thresholds["L2_open"]:
                     details = build_open_details("L2_open", args.asset, state)
-                    send_and_mark(notifier, state, "L2_open", total_pnl, positions, details)
+                    act_or_alert(trader, notifier, state, client, "L2_open", total_pnl, positions, details, args.asset, args.repeat_interval)
 
             elif ls == "L1_L2":
-                if total_pnl >= thresholds["L2_close"] and should_send(state, "L2_close", args.repeat_interval):
+                if total_pnl >= thresholds["L2_close"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L2_close", lot_snapshot, state, args.asset)
-                    send_and_mark(notifier, state, "L2_close", total_pnl, positions, details)
-                if total_pnl <= thresholds["L3_open"] and should_send(state, "L3_open", args.repeat_interval):
+                    act_or_alert(trader, notifier, state, client, "L2_close", total_pnl, positions, details, args.asset, args.repeat_interval)
+                if total_pnl <= thresholds["L3_open"]:
                     details = build_open_details("L3_open", args.asset, state)
-                    send_and_mark(notifier, state, "L3_open", total_pnl, positions, details)
+                    act_or_alert(trader, notifier, state, client, "L3_open", total_pnl, positions, details, args.asset, args.repeat_interval)
 
             elif ls == "L1_L2_L3":
-                if total_pnl >= thresholds["L3_close"] and should_send(state, "L3_close", args.repeat_interval):
+                if total_pnl >= thresholds["L3_close"]:
                     lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
                     details = build_close_details("L3_close", lot_snapshot, state, args.asset)
-                    send_and_mark(notifier, state, "L3_close", total_pnl, positions, details)
+                    act_or_alert(trader, notifier, state, client, "L3_close", total_pnl, positions, details, args.asset, args.repeat_interval)
                 if total_pnl <= thresholds["warning"] and should_send(state, "warning", args.repeat_interval):
                     send_and_mark(notifier, state, "warning", total_pnl, positions, "")
 
@@ -410,6 +598,7 @@ def main():
     p_mon.add_argument("--interval", type=int, default=30, help="Poll interval in seconds (default: 30)")
     p_mon.add_argument("--asset", type=float, default=1000, help="Asset size in USD for threshold scaling (default: 1000)")
     p_mon.add_argument("--repeat-interval", type=int, default=600, help="Repeat actionable alerts every N seconds until state changes (default: 600)")
+    p_mon.add_argument("--pending-timeout", type=int, default=180, help="Seconds to wait for a submitted action to change state (default: 180)")
     p_mon.set_defaults(func=cmd_monitor)
 
     p = sub.add_parser("status", help="Show current state")

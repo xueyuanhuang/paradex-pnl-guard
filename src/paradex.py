@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://api.prod.paradex.trade/v1"
 POSITIONS_URL = f"{API_BASE_URL}/positions"
 FILLS_URL = f"{API_BASE_URL}/fills"
+TRANSFERS_URL = f"{API_BASE_URL}/transfers"
 
 class ParadexClient:
     def __init__(self, jwt_token: str):
@@ -79,4 +80,23 @@ class ParadexClient:
             return None
         except Exception as e:
             logger.error(f"Unexpected error while fetching fills: {e}")
+            return None
+
+    def get_transfers(self, page_size: int = 20) -> Optional[List[Dict]]:
+        """Fetch recent account transfers for stablecoin operation notices."""
+        try:
+            response = requests.get(
+                TRANSFERS_URL,
+                headers=self.headers,
+                params={"page_size": page_size},
+                timeout=20
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("results", [])
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch transfers: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching transfers: {e}")
             return None

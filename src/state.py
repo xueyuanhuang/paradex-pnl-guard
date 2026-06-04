@@ -18,6 +18,17 @@ DEFAULT_STATE = {
         "warning": False
     },
     "alert_last_sent": {},
+    "auto_trade": {
+        "pending_action": None,
+        "expected_level": None,
+        "expected_direction": None,
+        "started_at": None,
+        "client_ids": []
+    },
+    "stablecoin_transfers": {
+        "initialized": False,
+        "seen": {}
+    },
     "last_total_pnl": 0.0,
     "last_update": None
 }
@@ -34,6 +45,10 @@ class GridState:
                 data = json.load(f)
             data.setdefault("alert_last_sent", {})
             data.setdefault("alerts_sent", copy.deepcopy(DEFAULT_STATE["alerts_sent"]))
+            data.setdefault("auto_trade", copy.deepcopy(DEFAULT_STATE["auto_trade"]))
+            data.setdefault("stablecoin_transfers", copy.deepcopy(DEFAULT_STATE["stablecoin_transfers"]))
+            data["stablecoin_transfers"].setdefault("initialized", False)
+            data["stablecoin_transfers"].setdefault("seen", {})
             return data
         return copy.deepcopy(DEFAULT_STATE)
 
@@ -87,6 +102,75 @@ class GridState:
     def update_pnl(self, pnl):
         self.data["last_total_pnl"] = pnl
 
+    @property
+    def pending_action(self):
+        return self.data.get("auto_trade", {}).get("pending_action")
+
+    def mark_auto_pending(self, action, expected_level, expected_direction, client_ids):
+        self.data["auto_trade"] = {
+            "pending_action": action,
+            "expected_level": expected_level,
+            "expected_direction": expected_direction,
+            "started_at": _now_iso(),
+            "client_ids": client_ids,
+        }
+
+    def clear_auto_pending(self):
+        self.data["auto_trade"] = copy.deepcopy(DEFAULT_STATE["auto_trade"])
+
+    def pending_confirmed(self, current_level, current_direction):
+        pending = self.data.get("auto_trade", {})
+        if not pending.get("pending_action"):
+            return False
+        if pending.get("expected_level") != current_level:
+            return False
+        expected_direction = pending.get("expected_direction")
+        return expected_direction in (None, 0, current_direction)
+
+    def pending_stale(self, stale_after_seconds):
+        pending = self.data.get("auto_trade", {})
+        started_at = pending.get("started_at")
+        if not pending.get("pending_action") or not started_at:
+            return False
+        try:
+            started_dt = datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        elapsed = (datetime.now(timezone.utc) - started_dt).total_seconds()
+        return elapsed >= stale_after_seconds
+
+    @property
+    def stablecoin_transfers_initialized(self):
+        return self.data.get("stablecoin_transfers", {}).get("initialized", False)
+
+    def seed_stablecoin_transfers(self, transfers):
+        self.data["stablecoin_transfers"] = {
+            "initialized": True,
+            "seen": {
+                str(t.get("id")): transfer_fingerprint(t)
+                for t in transfers
+                if t.get("id")
+            }
+        }
+
+    def transfer_notice_due(self, transfer):
+        transfer_id = transfer.get("id")
+        if not transfer_id or not self.stablecoin_transfers_initialized:
+            return False
+        seen = self.data.get("stablecoin_transfers", {}).get("seen", {})
+        return seen.get(str(transfer_id)) != transfer_fingerprint(transfer)
+
+    def mark_transfer_seen(self, transfer):
+        transfer_id = transfer.get("id")
+        if not transfer_id:
+            return
+        bucket = self.data.setdefault("stablecoin_transfers", {
+            "initialized": True,
+            "seen": {}
+        })
+        bucket["initialized"] = True
+        bucket.setdefault("seen", {})[str(transfer_id)] = transfer_fingerprint(transfer)
+
     # --- state transitions ---
 
     def transition_to(self, new_level, new_dir):
@@ -103,6 +187,7 @@ class GridState:
         else:
             # Reset alerts relevant to the new level
             self._reset_alerts_for_level(new_level)
+
 
     def _reset_alerts_for_level(self, level):
         """Reset alerts that are relevant to this level so they can fire again."""
@@ -136,3 +221,8 @@ class GridState:
 
 def _now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def transfer_fingerprint(transfer):
+    keys = ["kind", "status", "direction", "token", "amount", "last_updated_at"]
+    return "|".join(str(transfer.get(k, "")) for k in keys)

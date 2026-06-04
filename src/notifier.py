@@ -134,6 +134,38 @@ class TelegramNotifier:
 
         return self._send_message("\n".join(lines))
 
+    def send_trade_notice(self, title: str, lines: List[str]) -> bool:
+        """Send an automatic trading notice."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = "\n".join([title, f"Time: {timestamp}", "", *lines])
+        return self._send_message(text)
+
+    def send_stablecoin_notice(self, transfer: Dict) -> bool:
+        """Send a notice for stablecoin transfer/deposit/withdrawal changes."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fields = [
+            "💵 Stablecoin 操作通知",
+            f"Time: {timestamp}",
+            "",
+            f"Token: {transfer.get('token', 'UNKNOWN')}",
+            f"Amount: {transfer.get('amount', 'UNKNOWN')}",
+            f"Kind: {transfer.get('kind', 'UNKNOWN')}",
+            f"Direction: {transfer.get('direction', 'UNKNOWN')}",
+            f"Status: {transfer.get('status', 'UNKNOWN')}",
+        ]
+
+        bridge = transfer.get("bridge")
+        external_chain = transfer.get("external_chain")
+        failure_reason = transfer.get("failure_reason")
+        if bridge:
+            fields.append(f"Bridge: {bridge}")
+        if external_chain:
+            fields.append(f"External chain: {external_chain}")
+        if failure_reason:
+            fields.append(f"Failure reason: {failure_reason}")
+
+        return self._send_message("\n".join(fields))
+
     def poll_commands(self) -> List[str]:
         """Poll Telegram for /pnl commands."""
         commands = []
