@@ -29,3 +29,8 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Runtime state / backups
+state.json
+*.bak.*
+.env.bak.*
