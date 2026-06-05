@@ -76,7 +76,8 @@ System state:
 
 WS BBO circuit breaker:
 
-- If BTC or ETH BBO spread exceeds `0.5%`, WS triggers are disabled.
+- If BTC or ETH BBO spread exceeds `0.5%`, that sample falls back to REST.
+- A spread anomaly disables WS triggers only when the same market remains abnormal for at least `5s` and at least `5` samples.
 - If WS BBO PnL differs from REST PnL by more than `5 USDC`, WS triggers are disabled.
 - While disabled, the bot uses REST PnL only.
 - Recovery requires:
@@ -86,7 +87,7 @@ WS BBO circuit breaker:
   - WS/REST PnL divergence within limit
   - at least `120s` cooldown after the anomaly
   - `60s` of continuous healthy samples
-- Telegram is notified when WS triggers are disabled and when they recover.
+- Telegram is notified only when WS triggers are formally disabled and when they recover; transient spread anomalies only affect logs/runtime source selection.
 
 ## 2026-06-05 Incident
 

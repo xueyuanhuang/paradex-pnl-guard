@@ -380,29 +380,41 @@ def ws_bbo_issue(quotes, raw_ws_total_pnl, rest_total_pnl, max_spread_pct, max_d
     for market in (BTC_MARKET, ETH_MARKET):
         quote = quotes.get(market)
         if not quote:
-            return f"{market} BBO missing"
+            return {"kind": "missing", "key": market, "reason": f"{market} BBO missing"}
 
         bid = _to_float(quote.get("bid"))
         ask = _to_float(quote.get("ask"))
         if bid <= 0 or ask <= 0 or ask < bid:
-            return f"{market} BBO invalid bid={bid} ask={ask}"
+            return {
+                "kind": "invalid",
+                "key": market,
+                "reason": f"{market} BBO invalid bid={bid} ask={ask}",
+            }
 
         spread_pct = bbo_spread_pct(quote)
         if spread_pct is None:
-            return f"{market} BBO spread unavailable"
+            return {"kind": "invalid", "key": market, "reason": f"{market} BBO spread unavailable"}
         if max_spread_pct > 0 and spread_pct > max_spread_pct:
-            return (
-                f"{market} spread {spread_pct * 100:.3f}% exceeds "
-                f"{max_spread_pct * 100:.3f}%"
-            )
+            return {
+                "kind": "spread",
+                "key": market,
+                "reason": (
+                    f"{market} spread {spread_pct * 100:.3f}% exceeds "
+                    f"{max_spread_pct * 100:.3f}%"
+                ),
+            }
 
     if raw_ws_total_pnl is None:
-        return "WS_BBO PnL unavailable"
+        return {"kind": "pnl_unavailable", "key": "pnl", "reason": "WS_BBO PnL unavailable"}
     if max_divergence > 0 and abs(raw_ws_total_pnl - rest_total_pnl) > max_divergence:
-        return (
-            f"WS_BBO PnL {raw_ws_total_pnl:+.2f} differs from REST "
-            f"{rest_total_pnl:+.2f} by more than {max_divergence:.2f} USDC"
-        )
+        return {
+            "kind": "pnl_divergence",
+            "key": "pnl",
+            "reason": (
+                f"WS_BBO PnL {raw_ws_total_pnl:+.2f} differs from REST "
+                f"{rest_total_pnl:+.2f} by more than {max_divergence:.2f} USDC"
+            ),
+        }
 
     return None
 
@@ -413,6 +425,10 @@ class WsTriggerCircuit:
         self.disabled_at = None
         self.stable_since = None
         self.reason = None
+        self.issue_started_at = None
+        self.issue_sample_count = 0
+        self.issue_key = None
+        self.issue_reason = None
 
     def evaluate(self, now, ws_sample_ready, system_status, quotes, raw_ws_total_pnl, rest_total_pnl, args):
         if not ws_sample_ready:
@@ -422,7 +438,7 @@ class WsTriggerCircuit:
 
         system_issue = None
         if system_status is not None and system_status != "ok":
-            system_issue = f"SystemState={system_status}"
+            system_issue = {"kind": "system", "key": "system", "reason": f"SystemState={system_status}"}
 
         issue = system_issue or ws_bbo_issue(
             quotes,
@@ -434,21 +450,25 @@ class WsTriggerCircuit:
 
         if not self.disabled:
             if issue:
+                if issue["kind"] == "spread" and not self._spread_issue_confirmed(issue, now, args):
+                    return False, None
                 self.disabled = True
                 self.disabled_at = now
                 self.stable_since = None
-                self.reason = issue
+                self.reason = issue["reason"]
+                self._clear_pending_issue()
                 return False, "disabled"
+            self._clear_pending_issue()
             return True, None
 
         recovery_issue = issue
         if system_status != "ok":
-            recovery_issue = f"SystemState={system_status or 'unknown'}"
+            recovery_issue = {"kind": "system", "key": "system", "reason": f"SystemState={system_status or 'unknown'}"}
 
         disabled_since = self.disabled_at if self.disabled_at is not None else now
         cooldown_left = args.ws_circuit_cooldown - (now - disabled_since)
         if cooldown_left > 0:
-            recovery_issue = f"cooldown {cooldown_left:.0f}s"
+            recovery_issue = {"kind": "cooldown", "key": "cooldown", "reason": f"cooldown {cooldown_left:.0f}s"}
 
         if recovery_issue:
             self.stable_since = None
@@ -470,7 +490,33 @@ class WsTriggerCircuit:
     def status_label(self):
         if self.disabled:
             return f"circuit_off ({self.reason})"
+        if self.issue_reason:
+            elapsed = 0
+            if self.issue_started_at is not None:
+                elapsed = max(0, int(time.time() - self.issue_started_at))
+            return f"enabled (spread_watch {elapsed}s/{self.issue_sample_count}: {self.issue_reason})"
         return "enabled"
+
+    def _spread_issue_confirmed(self, issue, now, args):
+        if self.issue_key != issue["key"]:
+            self.issue_key = issue["key"]
+            self.issue_started_at = now
+            self.issue_sample_count = 1
+        else:
+            self.issue_sample_count += 1
+        self.issue_reason = issue["reason"]
+
+        elapsed = now - self.issue_started_at
+        return (
+            elapsed >= args.ws_spread_grace_seconds
+            and self.issue_sample_count >= args.ws_spread_grace_samples
+        )
+
+    def _clear_pending_issue(self):
+        self.issue_started_at = None
+        self.issue_sample_count = 0
+        self.issue_key = None
+        self.issue_reason = None
 
 
 def block_auto_action_if_system_not_ok(client, notifier, state, action_key):
@@ -895,6 +941,8 @@ def main():
     p_mon.add_argument("--ws-wait-timeout", type=float, default=1.0, help="Max seconds to wait for a websocket price update per loop (default: 1)")
     p_mon.add_argument("--ws-stale-after", type=float, default=10.0, help="Fallback to REST PnL if websocket is stale for N seconds (default: 10)")
     p_mon.add_argument("--ws-max-spread-pct", type=float, default=0.005, help="Disable websocket triggers if BTC or ETH BBO spread exceeds this ratio (default: 0.005 = 0.5%%)")
+    p_mon.add_argument("--ws-spread-grace-seconds", type=float, default=5.0, help="Require BBO spread anomaly to persist for this many seconds before circuit breaking (default: 5)")
+    p_mon.add_argument("--ws-spread-grace-samples", type=int, default=5, help="Require at least this many anomalous BBO samples before circuit breaking (default: 5)")
     p_mon.add_argument("--ws-rest-max-divergence", type=float, default=5.0, help="Ignore websocket PnL when it differs from REST PnL by more than this many USDC (default: 5)")
     p_mon.add_argument("--ws-circuit-cooldown", type=float, default=120.0, help="Seconds to keep websocket trigger disabled after a BBO anomaly (default: 120)")
     p_mon.add_argument("--ws-recovery-seconds", type=float, default=60.0, help="Seconds of continuous healthy BBO before restoring websocket triggers (default: 60)")
