@@ -361,6 +361,20 @@ def bbo_total_pnl(positions, quotes):
     return total if seen else None
 
 
+def sane_ws_pnl(ws_total_pnl, rest_total_pnl, max_divergence):
+    if ws_total_pnl is None:
+        return None
+    if max_divergence <= 0:
+        return ws_total_pnl
+    if abs(ws_total_pnl - rest_total_pnl) > max_divergence:
+        return None
+    return ws_total_pnl
+
+
+def rest_confirms_open(pnl_source, rest_total_pnl, threshold):
+    return pnl_source != "WS_BBO" or rest_total_pnl <= threshold
+
+
 def expected_after_action(action_key, state):
     mapping = {
         "L2_open": ("L1_L2", state.direction),
@@ -510,6 +524,8 @@ def cmd_monitor(args):
     last_rest_sync = 0.0
     last_log = 0.0
     last_state_save = 0.0
+    last_ws_reject_log = 0.0
+    last_open_guard_log = 0.0
 
     while True:
         try:
@@ -560,8 +576,16 @@ def cmd_monitor(args):
                 continue
 
             quotes = bbo_feed.snapshot() if bbo_feed else {}
-            ws_ready = bool(bbo_feed and bbo_feed.ready() and not bbo_feed.stale(args.ws_stale_after))
-            ws_total_pnl = bbo_total_pnl(positions, quotes) if ws_ready else None
+            ws_ready = bool(bbo_feed and bbo_feed.fresh(args.ws_stale_after))
+            raw_ws_total_pnl = bbo_total_pnl(positions, quotes) if ws_ready else None
+            ws_total_pnl = sane_ws_pnl(raw_ws_total_pnl, rest_total_pnl, args.ws_rest_max_divergence)
+            if raw_ws_total_pnl is not None and ws_total_pnl is None and now - last_ws_reject_log >= args.log_interval:
+                logger.warning(
+                    f"Ignoring WS_BBO PnL {raw_ws_total_pnl:+.2f}: "
+                    f"REST PnL is {rest_total_pnl:+.2f}, divergence exceeds "
+                    f"{args.ws_rest_max_divergence:.2f} USDC"
+                )
+                last_ws_reject_log = now
             total_pnl = ws_total_pnl if ws_total_pnl is not None else rest_total_pnl
             pnl_source = "WS_BBO" if ws_total_pnl is not None else "REST"
             price_marks = mark_prices_from_bbo(quotes) if ws_total_pnl is not None else None
@@ -624,11 +648,19 @@ def cmd_monitor(args):
                         details, args.asset, args.repeat_interval, price_marks
                     )
                 elif total_pnl <= thresholds["L2_open"]:
-                    details = build_open_details("L2_open", args.asset, state)
-                    acted = act_or_alert(
-                        trader, notifier, state, client, "L2_open", total_pnl, positions,
-                        details, args.asset, args.repeat_interval, price_marks
-                    )
+                    if not rest_confirms_open(pnl_source, rest_total_pnl, thresholds["L2_open"]):
+                        if now - last_open_guard_log >= args.log_interval:
+                            logger.warning(
+                                f"Skipping L2_open: WS_BBO PnL {total_pnl:+.2f} crossed "
+                                f"{thresholds['L2_open']:+.2f}, but REST PnL is {rest_total_pnl:+.2f}"
+                            )
+                            last_open_guard_log = now
+                    else:
+                        details = build_open_details("L2_open", args.asset, state)
+                        acted = act_or_alert(
+                            trader, notifier, state, client, "L2_open", total_pnl, positions,
+                            details, args.asset, args.repeat_interval, price_marks
+                        )
 
             elif ls == "L1_L2":
                 if total_pnl >= thresholds["L2_close"]:
@@ -639,11 +671,19 @@ def cmd_monitor(args):
                         details, args.asset, args.repeat_interval, price_marks
                     )
                 elif total_pnl <= thresholds["L3_open"]:
-                    details = build_open_details("L3_open", args.asset, state)
-                    acted = act_or_alert(
-                        trader, notifier, state, client, "L3_open", total_pnl, positions,
-                        details, args.asset, args.repeat_interval, price_marks
-                    )
+                    if not rest_confirms_open(pnl_source, rest_total_pnl, thresholds["L3_open"]):
+                        if now - last_open_guard_log >= args.log_interval:
+                            logger.warning(
+                                f"Skipping L3_open: WS_BBO PnL {total_pnl:+.2f} crossed "
+                                f"{thresholds['L3_open']:+.2f}, but REST PnL is {rest_total_pnl:+.2f}"
+                            )
+                            last_open_guard_log = now
+                    else:
+                        details = build_open_details("L3_open", args.asset, state)
+                        acted = act_or_alert(
+                            trader, notifier, state, client, "L3_open", total_pnl, positions,
+                            details, args.asset, args.repeat_interval, price_marks
+                        )
 
             elif ls == "L1_L2_L3":
                 if total_pnl >= thresholds["L3_close"]:
@@ -698,6 +738,7 @@ def main():
     p_mon.add_argument("--no-ws-bbo", dest="ws_bbo", action="store_false", help="Disable websocket BBO trigger source")
     p_mon.add_argument("--ws-wait-timeout", type=float, default=1.0, help="Max seconds to wait for a websocket price update per loop (default: 1)")
     p_mon.add_argument("--ws-stale-after", type=float, default=10.0, help="Fallback to REST PnL if websocket is stale for N seconds (default: 10)")
+    p_mon.add_argument("--ws-rest-max-divergence", type=float, default=5.0, help="Ignore websocket PnL when it differs from REST PnL by more than this many USDC (default: 5)")
     p_mon.add_argument("--pending-check-interval", type=float, default=5.0, help="REST position check interval while an action is pending (default: 5)")
     p_mon.add_argument("--log-interval", type=float, default=30.0, help="Log PnL at most every N seconds unless REST sync runs (default: 30)")
     p_mon.add_argument("--state-save-interval", type=float, default=30.0, help="Save state at least every N seconds (default: 30)")

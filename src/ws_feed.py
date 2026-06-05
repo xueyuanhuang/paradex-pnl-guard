@@ -53,6 +53,17 @@ class BboFeed:
         with self._lock:
             return all(market in self._quotes for market in self.markets)
 
+    def fresh(self, max_age_seconds):
+        now = time.time()
+        with self._lock:
+            for market in self.markets:
+                quote = self._quotes.get(market)
+                if not quote:
+                    return False
+                if now - quote.get("received_at", 0) > max_age_seconds:
+                    return False
+        return True
+
     def stale(self, max_age_seconds):
         if not self.last_message_at:
             return True
