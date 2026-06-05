@@ -56,14 +56,14 @@ The user-facing requirements are:
 
 ## PnL Sources
 
-REST position PnL is the authoritative safety source.
+REST position PnL is the only strategy trigger source. The default monitor poll interval is `5s`.
 
-WebSocket BBO can be used as a faster trigger source only when healthy. BBO PnL uses executable prices:
+WebSocket BBO is diagnostics-only. It can be logged to compare executable-price PnL and spread quality, but it must not trigger strategy actions or Telegram circuit-breaker notices.
 
 - LONG leg: `size * (bid - entry)`
 - SHORT leg: `size * (entry - ask)`
 
-For L2/L3 opening, REST must also confirm the loss threshold. This prevents a bad BBO tick from opening larger positions.
+Open and close thresholds are evaluated from REST position PnL only.
 
 ## Risk Controls
 
@@ -72,22 +72,13 @@ System state:
 - Before any live auto order, the bot calls Paradex `/v1/system/state`.
 - Orders are allowed only when `SystemState = ok`.
 - If the system is `cancel_only`, `maintenance`, or unknown, the action is blocked and Telegram is notified.
-- If a known SystemState is not `ok`, WS triggers are disabled and the bot falls back to REST.
 
-WS BBO circuit breaker:
+BBO diagnostics:
 
-- If BTC or ETH BBO spread exceeds `0.5%`, that sample falls back to REST.
-- A spread anomaly disables WS triggers only when the same market remains abnormal for at least `5s` and at least `5` samples.
-- If WS BBO PnL differs from REST PnL by more than `5 USDC`, WS triggers are disabled.
-- While disabled, the bot uses REST PnL only.
-- Recovery requires:
-  - `SystemState = ok`
-  - fresh BTC and ETH BBO
-  - normal spread
-  - WS/REST PnL divergence within limit
-  - at least `120s` cooldown after the anomaly
-  - `60s` of continuous healthy samples
-- Telegram is notified only when WS triggers are formally disabled and when they recover; transient spread anomalies only affect logs/runtime source selection.
+- BBO diagnostics are optional and enabled by default for logs only.
+- The bot may log BBO executable-price PnL and BTC/ETH spreads.
+- BBO does not trigger L1_TP, L2/L3 open, L2/L3 close, or warning actions.
+- BBO diagnostics must not send circuit-breaker/recovery Telegram messages.
 
 ## 2026-06-05 Incident
 
@@ -95,10 +86,9 @@ At `2026-06-05 04:45 UTC`, WS BBO produced `-20.32 USDC` while REST position PnL
 
 The likely cause was abnormal BBO during the Paradex maintenance/release window. The mitigation is now:
 
-- reject WS when it diverges from REST,
-- require REST confirmation for L2/L3 opens,
+- use REST as the only strategy trigger source,
 - block orders unless SystemState is `ok`,
-- disable WS triggers on abnormal BBO and restore only after sustained health.
+- keep BBO as diagnostics only.
 
 ## Maintenance Rules
 

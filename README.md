@@ -23,8 +23,8 @@ venv/bin/python src/main.py monitor --repeat-interval 600 --pending-timeout 180
 - Auto trading can submit live Paradex API market orders when enabled in `.env`.
 - The bot does not automatically stop loss.
 - Paradex `SystemState` must be `ok` before any live auto order.
-- REST position PnL is the authoritative safety source.
-- WebSocket BBO is only a fast trigger source when healthy; BBO anomalies disable WS triggering and fall back to REST.
+- REST position PnL is the only strategy trigger source; default polling is every 5 seconds.
+- WebSocket BBO is diagnostics-only and does not trigger strategy actions.
 
 ## Basic Commands
 
@@ -40,7 +40,7 @@ Start monitor:
 venv/bin/python src/main.py monitor
 ```
 
-Disable WS trigger source for a run:
+Disable BBO diagnostics for a run:
 
 ```bash
 venv/bin/python src/main.py monitor --no-ws-bbo
