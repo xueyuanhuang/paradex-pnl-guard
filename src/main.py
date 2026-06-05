@@ -361,18 +361,133 @@ def bbo_total_pnl(positions, quotes):
     return total if seen else None
 
 
-def sane_ws_pnl(ws_total_pnl, rest_total_pnl, max_divergence):
-    if ws_total_pnl is None:
-        return None
-    if max_divergence <= 0:
-        return ws_total_pnl
-    if abs(ws_total_pnl - rest_total_pnl) > max_divergence:
-        return None
-    return ws_total_pnl
-
-
 def rest_confirms_open(pnl_source, rest_total_pnl, threshold):
     return pnl_source != "WS_BBO" or rest_total_pnl <= threshold
+
+
+def bbo_spread_pct(quote):
+    bid = _to_float(quote.get("bid"))
+    ask = _to_float(quote.get("ask"))
+    if bid <= 0 or ask <= 0:
+        return None
+    mid = (bid + ask) / 2
+    if mid <= 0:
+        return None
+    return (ask - bid) / mid
+
+
+def ws_bbo_issue(quotes, raw_ws_total_pnl, rest_total_pnl, max_spread_pct, max_divergence):
+    for market in (BTC_MARKET, ETH_MARKET):
+        quote = quotes.get(market)
+        if not quote:
+            return f"{market} BBO missing"
+
+        bid = _to_float(quote.get("bid"))
+        ask = _to_float(quote.get("ask"))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return f"{market} BBO invalid bid={bid} ask={ask}"
+
+        spread_pct = bbo_spread_pct(quote)
+        if spread_pct is None:
+            return f"{market} BBO spread unavailable"
+        if max_spread_pct > 0 and spread_pct > max_spread_pct:
+            return (
+                f"{market} spread {spread_pct * 100:.3f}% exceeds "
+                f"{max_spread_pct * 100:.3f}%"
+            )
+
+    if raw_ws_total_pnl is None:
+        return "WS_BBO PnL unavailable"
+    if max_divergence > 0 and abs(raw_ws_total_pnl - rest_total_pnl) > max_divergence:
+        return (
+            f"WS_BBO PnL {raw_ws_total_pnl:+.2f} differs from REST "
+            f"{rest_total_pnl:+.2f} by more than {max_divergence:.2f} USDC"
+        )
+
+    return None
+
+
+class WsTriggerCircuit:
+    def __init__(self):
+        self.disabled = False
+        self.disabled_at = None
+        self.stable_since = None
+        self.reason = None
+
+    def evaluate(self, now, ws_sample_ready, system_status, quotes, raw_ws_total_pnl, rest_total_pnl, args):
+        if not ws_sample_ready:
+            if self.disabled:
+                self.stable_since = None
+            return False, None
+
+        system_issue = None
+        if system_status is not None and system_status != "ok":
+            system_issue = f"SystemState={system_status}"
+
+        issue = system_issue or ws_bbo_issue(
+            quotes,
+            raw_ws_total_pnl,
+            rest_total_pnl,
+            args.ws_max_spread_pct,
+            args.ws_rest_max_divergence,
+        )
+
+        if not self.disabled:
+            if issue:
+                self.disabled = True
+                self.disabled_at = now
+                self.stable_since = None
+                self.reason = issue
+                return False, "disabled"
+            return True, None
+
+        recovery_issue = issue
+        if system_status != "ok":
+            recovery_issue = f"SystemState={system_status or 'unknown'}"
+
+        disabled_since = self.disabled_at if self.disabled_at is not None else now
+        cooldown_left = args.ws_circuit_cooldown - (now - disabled_since)
+        if cooldown_left > 0:
+            recovery_issue = f"cooldown {cooldown_left:.0f}s"
+
+        if recovery_issue:
+            self.stable_since = None
+            return False, None
+
+        if self.stable_since is None:
+            self.stable_since = now
+            return False, None
+
+        if now - self.stable_since >= args.ws_recovery_seconds:
+            self.disabled = False
+            self.disabled_at = None
+            self.stable_since = None
+            self.reason = None
+            return True, "recovered"
+
+        return False, None
+
+    def status_label(self):
+        if self.disabled:
+            return f"circuit_off ({self.reason})"
+        return "enabled"
+
+
+def block_auto_action_if_system_not_ok(client, notifier, state, action_key):
+    status = client.get_system_state()
+    if status == "ok":
+        return False
+
+    notifier.send_trade_notice(
+        f"⏸ 自动执行暂停: {action_key}",
+        [
+            f"Paradex SystemState: {status or 'unknown'}",
+            "系统状态不是 ok，禁止提交新的自动交易订单。",
+            "本次没有记录 pending，下次到提醒间隔后会重新评估。",
+        ],
+    )
+    state.mark_alert(action_key)
+    return True
 
 
 def expected_after_action(action_key, state):
@@ -475,6 +590,8 @@ def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positio
     }
 
     if trader.enabled:
+        if not trader.dry_run and block_auto_action_if_system_not_ok(client, notifier, state, action_key):
+            return True
         return submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size, price_marks)
     return send_and_mark(notifier, state, action_key, total_pnl, positions, details)
 
@@ -513,6 +630,7 @@ def cmd_monitor(args):
     if args.ws_bbo:
         bbo_feed = BboFeed([BTC_MARKET, ETH_MARKET], logger=logger)
         bbo_feed.start()
+    ws_circuit = WsTriggerCircuit()
 
     logger.info(f"Grid Monitor started | Asset: ${args.asset} | Interval: {args.interval}s")
     logger.info(f"Thresholds: {thresholds}")
@@ -524,8 +642,9 @@ def cmd_monitor(args):
     last_rest_sync = 0.0
     last_log = 0.0
     last_state_save = 0.0
-    last_ws_reject_log = 0.0
     last_open_guard_log = 0.0
+    system_status = None
+    last_system_state_sync = 0.0
 
     while True:
         try:
@@ -535,6 +654,15 @@ def cmd_monitor(args):
                 time.sleep(args.interval)
 
             now = time.time()
+            system_due = system_status is None or now - last_system_state_sync >= args.system_state_interval
+            if system_due:
+                fresh_system_status = client.get_system_state()
+                if fresh_system_status:
+                    if fresh_system_status != system_status:
+                        logger.info(f"Paradex SystemState: {fresh_system_status}")
+                    system_status = fresh_system_status
+                last_system_state_sync = now
+
             rest_due = (
                 positions is None
                 or now - last_rest_sync >= args.interval
@@ -576,16 +704,42 @@ def cmd_monitor(args):
                 continue
 
             quotes = bbo_feed.snapshot() if bbo_feed else {}
-            ws_ready = bool(bbo_feed and bbo_feed.fresh(args.ws_stale_after))
-            raw_ws_total_pnl = bbo_total_pnl(positions, quotes) if ws_ready else None
-            ws_total_pnl = sane_ws_pnl(raw_ws_total_pnl, rest_total_pnl, args.ws_rest_max_divergence)
-            if raw_ws_total_pnl is not None and ws_total_pnl is None and now - last_ws_reject_log >= args.log_interval:
-                logger.warning(
-                    f"Ignoring WS_BBO PnL {raw_ws_total_pnl:+.2f}: "
-                    f"REST PnL is {rest_total_pnl:+.2f}, divergence exceeds "
-                    f"{args.ws_rest_max_divergence:.2f} USDC"
+            ws_sample_ready = bool(bbo_feed and bbo_feed.fresh(args.ws_stale_after))
+            raw_ws_total_pnl = bbo_total_pnl(positions, quotes) if ws_sample_ready else None
+            ws_allowed, ws_event = ws_circuit.evaluate(
+                now,
+                ws_sample_ready,
+                system_status,
+                quotes,
+                raw_ws_total_pnl,
+                rest_total_pnl,
+                args,
+            )
+
+            if ws_event == "disabled":
+                logger.warning(f"WS_BBO trigger circuit disabled: {ws_circuit.reason}")
+                notifier.send_trade_notice(
+                    "⚠️ WS BBO 触发已熔断",
+                    [
+                        f"原因: {ws_circuit.reason}",
+                        f"REST PnL: {rest_total_pnl:+.2f} USDC",
+                        f"WS PnL: {raw_ws_total_pnl:+.2f} USDC" if raw_ws_total_pnl is not None else "WS PnL: unavailable",
+                        "已切换到 REST PnL 判断；自动交易仍会检查 SystemState。",
+                    ],
                 )
-                last_ws_reject_log = now
+            elif ws_event == "recovered":
+                logger.info("WS_BBO trigger circuit recovered.")
+                notifier.send_trade_notice(
+                    "✅ WS BBO 触发已恢复",
+                    [
+                        f"Paradex SystemState: {system_status or 'unknown'}",
+                        f"REST PnL: {rest_total_pnl:+.2f} USDC",
+                        f"WS PnL: {raw_ws_total_pnl:+.2f} USDC" if raw_ws_total_pnl is not None else "WS PnL: unavailable",
+                        f"已连续稳定 {args.ws_recovery_seconds:.0f}s，重新启用实时触发。",
+                    ],
+                )
+
+            ws_total_pnl = raw_ws_total_pnl if ws_allowed else None
             total_pnl = ws_total_pnl if ws_total_pnl is not None else rest_total_pnl
             pnl_source = "WS_BBO" if ws_total_pnl is not None else "REST"
             price_marks = mark_prices_from_bbo(quotes) if ws_total_pnl is not None else None
@@ -595,7 +749,9 @@ def cmd_monitor(args):
             if now - last_log >= args.log_interval or rest_due:
                 logger.info(
                     f"PnL: {total_pnl:+.2f} ({pnl_source}) | "
-                    f"REST: {rest_total_pnl:+.2f} | State: {state.level_state} | Dir: {state.direction_label}"
+                    f"REST: {rest_total_pnl:+.2f} | State: {state.level_state} | "
+                    f"Dir: {state.direction_label} | System: {system_status or 'unknown'} | "
+                    f"WS: {ws_circuit.status_label()}"
                 )
                 last_log = now
 
@@ -738,7 +894,11 @@ def main():
     p_mon.add_argument("--no-ws-bbo", dest="ws_bbo", action="store_false", help="Disable websocket BBO trigger source")
     p_mon.add_argument("--ws-wait-timeout", type=float, default=1.0, help="Max seconds to wait for a websocket price update per loop (default: 1)")
     p_mon.add_argument("--ws-stale-after", type=float, default=10.0, help="Fallback to REST PnL if websocket is stale for N seconds (default: 10)")
+    p_mon.add_argument("--ws-max-spread-pct", type=float, default=0.005, help="Disable websocket triggers if BTC or ETH BBO spread exceeds this ratio (default: 0.005 = 0.5%%)")
     p_mon.add_argument("--ws-rest-max-divergence", type=float, default=5.0, help="Ignore websocket PnL when it differs from REST PnL by more than this many USDC (default: 5)")
+    p_mon.add_argument("--ws-circuit-cooldown", type=float, default=120.0, help="Seconds to keep websocket trigger disabled after a BBO anomaly (default: 120)")
+    p_mon.add_argument("--ws-recovery-seconds", type=float, default=60.0, help="Seconds of continuous healthy BBO before restoring websocket triggers (default: 60)")
+    p_mon.add_argument("--system-state-interval", type=float, default=30.0, help="Seconds between Paradex system state checks (default: 30)")
     p_mon.add_argument("--pending-check-interval", type=float, default=5.0, help="REST position check interval while an action is pending (default: 5)")
     p_mon.add_argument("--log-interval", type=float, default=30.0, help="Log PnL at most every N seconds unless REST sync runs (default: 30)")
     p_mon.add_argument("--state-save-interval", type=float, default=30.0, help="Save state at least every N seconds (default: 30)")

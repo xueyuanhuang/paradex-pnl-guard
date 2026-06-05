@@ -9,6 +9,7 @@ API_BASE_URL = "https://api.prod.paradex.trade/v1"
 POSITIONS_URL = f"{API_BASE_URL}/positions"
 FILLS_URL = f"{API_BASE_URL}/fills"
 TRANSFERS_URL = f"{API_BASE_URL}/transfers"
+SYSTEM_STATE_URL = f"{API_BASE_URL}/system/state"
 
 class ParadexClient:
     def __init__(self, jwt_token: str):
@@ -99,4 +100,23 @@ class ParadexClient:
             return None
         except Exception as e:
             logger.error(f"Unexpected error while fetching transfers: {e}")
+            return None
+
+    def get_system_state(self) -> Optional[str]:
+        """Fetch Paradex system status: ok, maintenance, or cancel_only."""
+        try:
+            response = requests.get(
+                SYSTEM_STATE_URL,
+                headers=self.headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            status = data.get("status")
+            return str(status).lower() if status else None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch system state: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching system state: {e}")
             return None
