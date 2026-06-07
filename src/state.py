@@ -25,6 +25,12 @@ DEFAULT_STATE = {
         "started_at": None,
         "client_ids": []
     },
+    "halted": {
+        "active": False,
+        "reason": None,
+        "action": None,
+        "started_at": None
+    },
     "stablecoin_transfers": {
         "initialized": False,
         "seen": {}
@@ -46,6 +52,7 @@ class GridState:
             data.setdefault("alert_last_sent", {})
             data.setdefault("alerts_sent", copy.deepcopy(DEFAULT_STATE["alerts_sent"]))
             data.setdefault("auto_trade", copy.deepcopy(DEFAULT_STATE["auto_trade"]))
+            data.setdefault("halted", copy.deepcopy(DEFAULT_STATE["halted"]))
             data.setdefault("stablecoin_transfers", copy.deepcopy(DEFAULT_STATE["stablecoin_transfers"]))
             data["stablecoin_transfers"].setdefault("initialized", False)
             data["stablecoin_transfers"].setdefault("seen", {})
@@ -105,6 +112,26 @@ class GridState:
     @property
     def pending_action(self):
         return self.data.get("auto_trade", {}).get("pending_action")
+
+    @property
+    def is_halted(self):
+        return bool(self.data.get("halted", {}).get("active"))
+
+    @property
+    def halt_reason(self):
+        return self.data.get("halted", {}).get("reason")
+
+    def halt(self, action, reason):
+        self.clear_auto_pending()
+        self.data["halted"] = {
+            "active": True,
+            "reason": reason,
+            "action": action,
+            "started_at": _now_iso(),
+        }
+
+    def clear_halt(self):
+        self.data["halted"] = copy.deepcopy(DEFAULT_STATE["halted"])
 
     def mark_auto_pending(self, action, expected_level, expected_direction, client_ids):
         self.data["auto_trade"] = {

@@ -25,6 +25,7 @@ venv/bin/python src/main.py monitor --repeat-interval 600 --pending-timeout 180
 - Paradex `SystemState` must be `ok` before any live auto order.
 - REST position PnL is the only strategy trigger source; default polling is every 5 seconds.
 - WebSocket BBO is diagnostics-only and does not trigger strategy actions.
+- Every submitted BTC/ETH leg is verified from order history. If any leg fails or partially fills, the bot attempts reduce-only flattening, halts, and waits for manual resume.
 
 ## Basic Commands
 
@@ -32,6 +33,12 @@ Show current grid state:
 
 ```bash
 venv/bin/python src/main.py status
+```
+
+Clear a halted state after manual position verification:
+
+```bash
+venv/bin/python src/main.py resume
 ```
 
 Start monitor:

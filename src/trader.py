@@ -57,6 +57,24 @@ class AutoTrader:
             self._market_order(ETH_MARKET, eth_side, eth_size, f"{client_prefix}-eth-close", reduce_only=True),
         ]
 
+    def close_position_orders(self, positions, client_prefix):
+        orders = []
+        for pos in positions:
+            market = pos.get("market")
+            if market not in (BTC_MARKET, ETH_MARKET):
+                continue
+
+            size = abs(Decimal(str(pos.get("size", 0) or 0)))
+            if size <= 0:
+                continue
+
+            side = OrderSide.Sell if pos.get("side") == "LONG" else OrderSide.Buy
+            asset = market.split("-")[0].lower()
+            orders.append(
+                self._market_order(market, side, size, f"{client_prefix}-{asset}-flatten", reduce_only=True)
+            )
+        return orders
+
     def open_notional_orders(self, level, btc_notional, eth_notional, marks, direction, client_prefix):
         if BTC_MARKET not in marks or ETH_MARKET not in marks:
             raise RuntimeError("Cannot open by notional without BTC and ETH mark prices")

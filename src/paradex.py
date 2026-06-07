@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://api.prod.paradex.trade/v1"
 POSITIONS_URL = f"{API_BASE_URL}/positions"
 FILLS_URL = f"{API_BASE_URL}/fills"
+ORDERS_HISTORY_URL = f"{API_BASE_URL}/orders-history"
 TRANSFERS_URL = f"{API_BASE_URL}/transfers"
 SYSTEM_STATE_URL = f"{API_BASE_URL}/system/state"
 
@@ -82,6 +83,42 @@ class ParadexClient:
         except Exception as e:
             logger.error(f"Unexpected error while fetching fills: {e}")
             return None
+
+    def get_order_history(self, client_id: Optional[str] = None, start_at: Optional[int] = None, page_size: int = 100) -> Optional[List[Dict]]:
+        """Fetch order history, optionally filtered by client_id."""
+        params = {"page_size": page_size}
+        if client_id is not None:
+            params["client_id"] = client_id
+        if start_at is not None:
+            params["start_at"] = start_at
+
+        try:
+            response = requests.get(
+                ORDERS_HISTORY_URL,
+                headers=self.headers,
+                params=params,
+                timeout=20
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("results", [])
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch order history: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching order history: {e}")
+            return None
+
+    def get_order_by_client_id(self, client_id: str) -> Optional[Dict]:
+        """Fetch the latest history record for an exact client_id."""
+        orders = self.get_order_history(client_id=client_id, page_size=20)
+        if not orders:
+            return None
+
+        exact = [o for o in orders if o.get("client_id") == client_id]
+        if not exact:
+            return None
+        return sorted(exact, key=lambda o: int(o.get("created_at") or 0))[-1]
 
     def get_transfers(self, page_size: int = 20) -> Optional[List[Dict]]:
         """Fetch recent account transfers for stablecoin operation notices."""

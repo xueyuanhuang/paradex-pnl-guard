@@ -114,6 +114,8 @@ class TelegramNotifier:
         if state:
             level_display = state.level_state.replace("_", "+")
             lines.append(f"📐 Grid: {level_display} | {state.direction_label}")
+            if state.is_halted:
+                lines.append(f"⏸ Halted: {state.halt_reason or 'unknown'}")
 
         lines.append("")
 
@@ -124,12 +126,12 @@ class TelegramNotifier:
                 market = p.get("market", "Unknown")
                 pnl = float(p.get("unrealized_pnl", 0))
                 side = p.get("side", "UNKNOWN")
-                size = p.get("size", "0")
-                entry = p.get("avg_entry_price", "N/A")
+                size = _signed_size(p)
+                notional = _format_usd(abs(_to_float(p.get("cost"))))
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
                 lines.append(
                     f"{pnl_emoji} *{market}* ({side})\n"
-                    f"  PnL: `{pnl:+.2f}` | Size: {size} | Entry: {entry}"
+                    f"  PnL: `{pnl:+.2f}` | Size: {size} | Notional: {notional}"
                 )
 
         return self._send_message("\n".join(lines))
@@ -220,3 +222,21 @@ class TelegramNotifier:
                 f.write(f"{timestamp} | {alert_type} | PnL: {total_pnl:+.2f}\n")
         except Exception as e:
             logger.error(f"Failed to write alerts.log: {e}")
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _signed_size(position):
+    size = abs(_to_float(position.get("size")))
+    if position.get("side") == "SHORT":
+        size = -size
+    return f"{size:.8f}".rstrip("0").rstrip(".")
+
+
+def _format_usd(value):
+    return f"${value:,.2f}"

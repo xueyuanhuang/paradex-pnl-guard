@@ -5,6 +5,7 @@ import signal
 import sys
 import os
 from dotenv import load_dotenv
+from paradex_py.common.order import OrderSide
 
 load_dotenv()
 
@@ -67,6 +68,34 @@ def detect_grid_level(positions, asset_size):
         return "L1_L2", direction
     else:
         return "L1_L2_L3", direction
+
+
+def position_integrity_issue(positions, asset_size):
+    pos_by_market = position_map(positions)
+    btc_pos = pos_by_market.get(BTC_MARKET)
+    eth_pos = pos_by_market.get(ETH_MARKET)
+
+    if not btc_pos and not eth_pos:
+        return None
+    if not btc_pos or not eth_pos:
+        missing = "BTC" if not btc_pos else "ETH"
+        return f"{missing} leg is missing while the other leg is open"
+
+    btc_side = btc_pos.get("side")
+    eth_side = eth_pos.get("side")
+    if not ((btc_side == "LONG" and eth_side == "SHORT") or (btc_side == "SHORT" and eth_side == "LONG")):
+        return f"BTC/ETH sides are not paired: BTC {btc_side}, ETH {eth_side}"
+
+    btc_notional = abs(_to_float(btc_pos.get("cost")))
+    eth_notional = abs(_to_float(eth_pos.get("cost")))
+    if btc_notional <= 0 or eth_notional <= 0:
+        return f"BTC/ETH notional is invalid: BTC {btc_notional:.2f}, ETH {eth_notional:.2f}"
+
+    eth_to_btc = eth_notional / btc_notional
+    if eth_to_btc < 0.30 or eth_to_btc > 1.25:
+        return f"BTC/ETH notional ratio is abnormal: ETH/BTC {eth_to_btc:.2f}"
+
+    return None
 
 
 def opening_side_for(market, direction):
@@ -203,6 +232,183 @@ def format_size(value):
 
 def format_money(value):
     return f"${value:,.0f}"
+
+
+def format_usd(value):
+    return f"${value:,.2f}"
+
+
+def market_asset(market):
+    return "BTC" if market == BTC_MARKET else "ETH"
+
+
+def signed_position_size(position):
+    size = abs(_to_float(position.get("size")))
+    if position.get("side") == "SHORT":
+        size = -size
+    return format_size(size)
+
+
+def order_side_label(order):
+    return "买入" if order.order_side == OrderSide.Buy else "卖出"
+
+
+def order_expected_size(order):
+    return _to_float(order.size)
+
+
+def order_status_size(status):
+    if not status:
+        return 0.0, 0.0
+
+    total_size = _to_float(status.get("size"))
+    remaining = _to_float(status.get("remaining_size"))
+    filled = _to_float(status.get("filled_size"), None)
+    if filled is None:
+        filled = max(0.0, total_size - remaining)
+    return filled, remaining
+
+
+def order_avg_price(status):
+    if not status:
+        return 0.0
+    return _to_float(status.get("avg_fill_price")) or _to_float(status.get("price"))
+
+
+def order_notional(status):
+    filled, _ = order_status_size(status)
+    return abs(filled * order_avg_price(status))
+
+
+def order_tolerance(order):
+    return 0.000005 if order.market == BTC_MARKET else 0.00005
+
+
+def order_fully_filled(order, status):
+    if not status:
+        return False
+    if order_terminal_failure(status):
+        return False
+    filled, remaining = order_status_size(status)
+    expected = order_expected_size(order)
+    tol = order_tolerance(order)
+    return filled >= expected - tol and remaining <= tol
+
+
+def order_terminal_failure(status):
+    if not status:
+        return False
+    if status.get("cancel_reason"):
+        return True
+    status_text = str(status.get("status") or "").upper()
+    failure_tokens = ("CANCEL", "REJECT", "EXPIRE", "FAIL")
+    return any(token in status_text for token in failure_tokens)
+
+
+def order_failure_reason(order, status):
+    if not status:
+        return "ORDER_HISTORY_NOT_FOUND"
+    reason = status.get("cancel_reason")
+    if reason:
+        return reason
+    if order_terminal_failure(status):
+        return status.get("status") or "ORDER_FAILED"
+    if not order_fully_filled(order, status):
+        filled, remaining = order_status_size(status)
+        return f"PARTIAL_OR_UNFILLED filled={format_size(filled)} remaining={format_size(remaining)}"
+    return ""
+
+
+def wait_for_order_statuses(client, orders, timeout=15.0, poll_interval=1.0):
+    statuses = {}
+    deadline = time.time() + timeout
+
+    while time.time() <= deadline:
+        all_found = True
+        for order in orders:
+            status = client.get_order_by_client_id(order.client_id)
+            if status:
+                statuses[order.client_id] = status
+            else:
+                all_found = False
+
+        if all_found and all(order_fully_filled(order, statuses.get(order.client_id)) for order in orders):
+            break
+        if any(order_terminal_failure(statuses.get(order.client_id)) for order in orders):
+            break
+        time.sleep(poll_interval)
+
+    return statuses
+
+
+def simulated_order_statuses(orders):
+    return {
+        order.client_id: {
+            "client_id": order.client_id,
+            "market": order.market,
+            "side": "BUY" if order.order_side == OrderSide.Buy else "SELL",
+            "size": str(order.size),
+            "remaining_size": "0",
+            "avg_fill_price": "0",
+            "cancel_reason": "",
+            "status": "DRY_RUN",
+        }
+        for order in orders
+    }
+
+
+def summarize_orders(orders, statuses):
+    lines = []
+    for order in sorted(orders, key=lambda o: o.market):
+        status = statuses.get(order.client_id)
+        filled, _ = order_status_size(status)
+        notional = order_notional(status)
+        asset = market_asset(order.market)
+        reason = order_failure_reason(order, status)
+        base = (
+            f"{asset}: {order_side_label(order)} {format_size(filled)} {asset}"
+            f" | 名义价值 {format_usd(notional)}"
+        )
+        if reason:
+            base += f" | 未完全成交，原因: {reason}"
+        lines.append(base)
+    return lines
+
+
+def summarize_positions(positions):
+    if not positions:
+        return ["无持仓"]
+
+    lines = []
+    by_market = position_map(positions)
+    for market in (BTC_MARKET, ETH_MARKET):
+        pos = by_market.get(market)
+        if not pos:
+            continue
+        pnl = _to_float(pos.get("unrealized_pnl"))
+        side = pos.get("side", "UNKNOWN")
+        asset = market_asset(market)
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        lines.extend([
+            f"{emoji} {market} ({side})",
+            (
+                f"  PnL: {pnl:+.2f} USDC"
+                f" | Size: {signed_position_size(pos)} {asset}"
+                f" | Notional: {format_usd(abs(_to_float(pos.get('cost'))))}"
+            ),
+        ])
+    return lines or ["无持仓"]
+
+
+def operation_kind(action_key):
+    return "open" if action_key in {"L2_open", "L3_open", "L1_open"} else "close"
+
+
+def operation_title(action_key, kind, success=True):
+    label = "开仓" if kind == "open" else "平仓"
+    if success:
+        return f"✅ {label}完成：{action_key}"
+    return f"⚠️ {label}异常暂停：{action_key}"
 
 
 def scaled_open_notional(alert_type, asset_size):
@@ -373,32 +579,95 @@ def bbo_diagnostics(positions, quotes):
     return ws_total_pnl, ", ".join(spreads)
 
 
-def block_auto_action_if_system_not_ok(client, notifier, state, action_key):
+def direction_label_for(direction):
+    if direction == 1:
+        return "LONG BTC / SHORT ETH"
+    if direction == -1:
+        return "SHORT BTC / LONG ETH"
+    return "NONE"
+
+
+def send_operation_notice(notifier, title, action_key, kind, total_pnl, direction_label, orders, statuses, positions, extra_lines=None):
+    action_label = "开仓" if kind == "open" else "平仓"
+    lines = [
+        f"方向: {direction_label}",
+        f"触发: REST PnL {total_pnl:+.2f} USDC",
+        "",
+        f"本次{action_label}:",
+    ]
+    if orders:
+        lines.extend(summarize_orders(orders, statuses))
+    else:
+        lines.append("未提交订单")
+
+    if extra_lines:
+        lines.extend(["", "处理:", *extra_lines])
+
+    lines.extend(["", f"{action_label}后剩余仓位:", *summarize_positions(positions)])
+    return notifier.send_trade_notice(title, lines)
+
+
+def sync_state_from_positions(state, positions, asset_size):
+    detected_level, detected_dir = detect_grid_level(positions, asset_size)
+    if detected_level != state.level_state:
+        old = state.level_state
+        state.transition_to(detected_level, detected_dir)
+        logger.info(f"Level change: {old} -> {detected_level}")
+
+    if detected_dir != 0 and detected_dir != state.direction:
+        state.data["direction"] = detected_dir
+
+
+def block_auto_action_if_system_not_ok(client, notifier, state, action_key, total_pnl, positions, direction_label=None):
     status = client.get_system_state()
     if status == "ok":
         return False
 
-    notifier.send_trade_notice(
-        f"⏸ 自动执行暂停: {action_key}",
+    kind = operation_kind(action_key)
+    reason = f"Paradex SystemState is {status or 'unknown'}"
+    state.halt(action_key, reason)
+    send_operation_notice(
+        notifier,
+        operation_title(action_key, kind, success=False),
+        action_key,
+        kind,
+        total_pnl,
+        direction_label or state.direction_label,
+        [],
+        {},
+        positions,
         [
-            f"Paradex SystemState: {status or 'unknown'}",
-            "系统状态不是 ok，禁止提交新的自动交易订单。",
-            "本次没有记录 pending，下次到提醒间隔后会重新评估。",
+            f"未提交订单，原因: {reason}",
+            "机器人已暂停，等待人工确认。",
         ],
     )
-    state.mark_alert(action_key)
+    if action_key in state.data.get("alerts_sent", {}):
+        state.mark_alert(action_key)
     return True
 
 
-def expected_after_action(action_key, state):
-    mapping = {
-        "L2_open": ("L1_L2", state.direction),
-        "L3_open": ("L1_L2_L3", state.direction),
-        "L3_close": ("L1_L2", state.direction),
-        "L2_close": ("L1", state.direction),
-        "L1_TP": ("L1", -state.direction if state.direction else 0),
-    }
-    return mapping[action_key]
+def halt_before_submit(notifier, state, action_key, kind, total_pnl, direction_label, positions, asset_size, detail):
+    reason = f"{action_key} pre-submit check failed: {detail}"
+    state.halt(action_key, reason)
+    sync_state_from_positions(state, positions, asset_size)
+    send_operation_notice(
+        notifier,
+        operation_title(action_key, kind, success=False),
+        action_key,
+        kind,
+        total_pnl,
+        direction_label,
+        [],
+        {},
+        positions,
+        [
+            f"下单前检查失败: {detail}",
+            "未提交订单。",
+            "机器人已暂停，等待人工确认。",
+        ],
+    )
+    if action_key in state.data.get("alerts_sent", {}):
+        state.mark_alert(action_key)
 
 
 def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size, price_marks=None):
@@ -416,65 +685,197 @@ def build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_
         btc_notional, eth_notional = scaled_open_notional("L3_open", asset_size)
         return trader.open_notional_orders("L3", btc_notional, eth_notional, marks, state.direction, prefix)
     if action_key == "L1_TP":
-        orders = trader.close_lot_orders("L1", lot_snapshot, state.direction, prefix)
-        btc_notional, eth_notional = scaled_open_notional("L1_TP", asset_size)
-        orders.extend(trader.open_notional_orders("L1", btc_notional, eth_notional, marks, -state.direction, prefix))
-        return orders
+        return trader.close_lot_orders("L1", lot_snapshot, state.direction, prefix)
 
     raise RuntimeError(f"Unsupported auto action: {action_key}")
 
 
-def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, action_details, lot_snapshot, asset_size, price_marks=None):
-    expected_level, expected_direction = expected_after_action(action_key, state)
-    orders = build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size, price_marks)
-    order_text = trader.describe_orders(orders)
+def flatten_all_positions(trader, client, reason):
+    positions = client.get_open_positions() or []
+    if not positions:
+        return {
+            "orders": [],
+            "statuses": {},
+            "positions": [],
+            "lines": ["没有剩余仓位需要平。"],
+        }
 
-    notifier.send_trade_notice(
-        f"🤖 自动执行准备: {action_key}",
-        [
-            f"Mode: {trader.mode_label()}",
-            f"Total PnL: {total_pnl:+.2f} USDC",
-            "",
-            action_details,
-            "",
-            "订单:",
-            order_text,
-        ],
-    )
+    orders = trader.close_position_orders(positions, f"halt-flatten-{int(time.time())}")
+    if not orders:
+        return {
+            "orders": [],
+            "statuses": {},
+            "positions": positions,
+            "lines": ["未找到可提交的 reduce-only 清仓订单，请人工检查。"],
+        }
 
+    lines = [f"触发清仓原因: {reason}", "已尝试 reduce-only 平掉所有剩余仓位。"]
     try:
-        result = trader.submit_batch(orders)
+        trader.submit_batch(orders)
+    except Exception as e:
+        detail = error_detail(e)
+        logger.error(f"Flatten failed: {detail}")
+        lines.append(f"清仓提交失败: {detail}")
+        return {
+            "orders": orders,
+            "statuses": {},
+            "positions": client.get_open_positions() or positions,
+            "lines": lines,
+        }
+
+    statuses = simulated_order_statuses(orders) if trader.dry_run else wait_for_order_statuses(client, orders)
+    if not all(order_fully_filled(order, statuses.get(order.client_id)) for order in orders):
+        lines.append("清仓订单未完全成交，请立即人工检查。")
+
+    time.sleep(2)
+    return {
+        "orders": orders,
+        "statuses": statuses,
+        "positions": client.get_open_positions() or [],
+        "lines": lines,
+    }
+
+
+def submit_order_set_checked(trader, notifier, state, client, action_key, kind, total_pnl, orders, asset_size, direction_label):
+    try:
+        trader.submit_batch(orders)
     except Exception as e:
         detail = error_detail(e)
         logger.error(f"Auto execution failed for {action_key}: {detail}")
-        notifier.send_trade_notice(
-            f"❌ 自动执行失败: {action_key}",
-            [
-                f"Error: {detail}",
-                "本次没有记录 pending，下次到提醒间隔后会再尝试。",
-            ],
+        cleanup = flatten_all_positions(trader, client, f"{action_key} submit failed")
+        final_positions = cleanup["positions"]
+        reason = f"{action_key} submit failed: {detail}"
+        state.halt(action_key, reason)
+        sync_state_from_positions(state, final_positions, asset_size)
+        send_operation_notice(
+            notifier,
+            operation_title(action_key, kind, success=False),
+            action_key,
+            kind,
+            total_pnl,
+            direction_label,
+            orders,
+            {},
+            final_positions,
+            [f"提交失败: {detail}", *cleanup["lines"], "机器人已暂停，等待人工确认。"],
         )
+        if action_key in state.data.get("alerts_sent", {}):
+            state.mark_alert(action_key)
+        return False, final_positions
+
+    statuses = simulated_order_statuses(orders) if trader.dry_run else wait_for_order_statuses(client, orders)
+    success = all(order_fully_filled(order, statuses.get(order.client_id)) for order in orders)
+    if not success:
+        reasons = [
+            f"{market_asset(order.market)}: {order_failure_reason(order, statuses.get(order.client_id))}"
+            for order in orders
+            if not order_fully_filled(order, statuses.get(order.client_id))
+        ]
+        reason = "; ".join(reasons)
+        cleanup = flatten_all_positions(trader, client, f"{action_key} leg verification failed")
+        final_positions = cleanup["positions"]
+        state.halt(action_key, reason)
+        sync_state_from_positions(state, final_positions, asset_size)
+        send_operation_notice(
+            notifier,
+            operation_title(action_key, kind, success=False),
+            action_key,
+            kind,
+            total_pnl,
+            direction_label,
+            orders,
+            statuses,
+            final_positions,
+            [f"成交校验失败: {reason}", *cleanup["lines"], "机器人已暂停，等待人工确认。"],
+        )
+        if action_key in state.data.get("alerts_sent", {}):
+            state.mark_alert(action_key)
+        return False, final_positions
+
+    time.sleep(2)
+    post_positions = client.get_open_positions() or []
+    sync_state_from_positions(state, post_positions, asset_size)
+    send_operation_notice(
+        notifier,
+        operation_title(action_key, kind, success=True),
+        action_key,
+        kind,
+        total_pnl,
+        direction_label,
+        orders,
+        statuses,
+        post_positions,
+    )
+    if action_key in state.data.get("alerts_sent", {}):
         state.mark_alert(action_key)
+    return True, post_positions
+
+
+def submit_l1_take_profit(trader, notifier, state, client, total_pnl, positions, lot_snapshot, asset_size, price_marks=None):
+    old_direction = state.direction
+    prefix = f"L1_TP-{int(time.time())}"
+    try:
+        close_orders = trader.close_lot_orders("L1", lot_snapshot, old_direction, prefix)
+    except Exception as e:
+        detail = error_detail(e)
+        logger.error(f"Cannot build L1_TP close orders: {detail}")
+        halt_before_submit(
+            notifier, state, "L1_TP", "close", total_pnl,
+            direction_label_for(old_direction), positions, asset_size, detail
+        )
         return True
 
-    client_ids = [order.client_id for order in orders]
-    state.mark_auto_pending(action_key, expected_level, expected_direction, client_ids)
-    state.mark_alert(action_key)
-    result_text = str(result)
-    if len(result_text) > 1200:
-        result_text = result_text[:1200] + "..."
+    close_ok, close_positions = submit_order_set_checked(
+        trader, notifier, state, client, "L1_TP", "close", total_pnl,
+        close_orders, asset_size, direction_label_for(old_direction)
+    )
+    if not close_ok or state.is_halted:
+        return True
 
-    notifier.send_trade_notice(
-        f"✅ 自动执行已提交: {action_key}",
-        [
-            f"等待确认状态: {expected_level}",
-            f"Client IDs: {', '.join(client_ids)}",
-            "",
-            "订单:",
-            order_text,
-            "",
-            f"Result: {result_text}",
-        ],
+    if not trader.dry_run and block_auto_action_if_system_not_ok(
+        client, notifier, state, "L1_open", total_pnl, close_positions, direction_label_for(-old_direction)
+    ):
+        return True
+
+    btc_notional, eth_notional = scaled_open_notional("L1_TP", asset_size)
+    marks = price_marks or mark_prices_from_positions(positions)
+    try:
+        open_orders = trader.open_notional_orders("L1", btc_notional, eth_notional, marks, -old_direction, prefix)
+    except Exception as e:
+        detail = error_detail(e)
+        logger.error(f"Cannot build L1 reverse-open orders: {detail}")
+        halt_before_submit(
+            notifier, state, "L1_open", "open", total_pnl,
+            direction_label_for(-old_direction), close_positions, asset_size, detail
+        )
+        return True
+
+    submit_order_set_checked(
+        trader, notifier, state, client, "L1_open", "open", total_pnl,
+        open_orders, asset_size, direction_label_for(-old_direction)
+    )
+    return True
+
+
+def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, action_details, lot_snapshot, asset_size, client, price_marks=None):
+    if action_key == "L1_TP":
+        return submit_l1_take_profit(trader, notifier, state, client, total_pnl, positions, lot_snapshot, asset_size, price_marks)
+
+    kind = operation_kind(action_key)
+    try:
+        orders = build_auto_orders(trader, action_key, lot_snapshot, positions, state, asset_size, price_marks)
+    except Exception as e:
+        detail = error_detail(e)
+        logger.error(f"Cannot build auto orders for {action_key}: {detail}")
+        halt_before_submit(
+            notifier, state, action_key, kind, total_pnl,
+            state.direction_label, positions, asset_size, detail
+        )
+        return True
+
+    submit_order_set_checked(
+        trader, notifier, state, client, action_key, kind, total_pnl,
+        orders, asset_size, state.direction_label
     )
     return True
 
@@ -490,9 +891,9 @@ def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positio
     }
 
     if trader.enabled:
-        if not trader.dry_run and block_auto_action_if_system_not_ok(client, notifier, state, action_key):
+        if not trader.dry_run and block_auto_action_if_system_not_ok(client, notifier, state, action_key, total_pnl, positions):
             return True
-        return submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size, price_marks)
+        return submit_auto_action(trader, notifier, state, action_key, total_pnl, positions, details, lot_snapshot, asset_size, client, price_marks)
     return send_and_mark(notifier, state, action_key, total_pnl, positions, details)
 
 
@@ -585,13 +986,38 @@ def cmd_monitor(args):
 
                     notify_stablecoin_transfers(client, notifier, state)
 
+                    integrity_issue = position_integrity_issue(positions, args.asset)
+                    if integrity_issue and not state.is_halted:
+                        logger.error(f"Position integrity issue: {integrity_issue}")
+                        if trader.enabled and not trader.dry_run:
+                            cleanup = flatten_all_positions(trader, client, integrity_issue)
+                            positions = cleanup["positions"]
+                        state.halt("position_integrity", integrity_issue)
+                        notifier.send_trade_notice(
+                            operation_title("position_integrity", "close", success=False),
+                            [
+                                f"方向: {state.direction_label}",
+                                f"触发: REST PnL {rest_total_pnl:+.2f} USDC",
+                                "",
+                                "本次平仓:",
+                                "检测到 BTC/ETH 仓位不成对，已进入保护处理。",
+                                "",
+                                "处理:",
+                                *(cleanup["lines"] if trader.enabled and not trader.dry_run else [integrity_issue]),
+                                "机器人已暂停，等待人工确认。",
+                                "",
+                                "平仓后剩余仓位:",
+                                *summarize_positions(positions),
+                            ],
+                        )
+                        state.save()
+                        continue
+
                     detected_level, detected_dir = detect_grid_level(positions, args.asset)
                     if detected_level != state.level_state:
                         old = state.level_state
                         state.transition_to(detected_level, detected_dir)
                         logger.info(f"Level change: {old} -> {detected_level}")
-                        if detected_level == "FLAT" and old != "FLAT":
-                            notifier.send_grid_alert("flat", 0, state, [], build_open_details("flat", args.asset, state))
 
                     if detected_dir != 0 and detected_dir != state.direction:
                         state.data["direction"] = detected_dir
@@ -626,30 +1052,13 @@ def cmd_monitor(args):
 
             if state.pending_action:
                 if state.pending_confirmed(state.level_state, state.direction):
-                    pending = state.pending_action
-                    notifier.send_trade_notice(
-                        f"✅ 自动执行已确认: {pending}",
-                        [
-                            f"当前状态: {state.level_state}",
-                            f"方向: {state.direction_label}",
-                            f"Total PnL: {total_pnl:+.2f} USDC",
-                        ],
-                    )
                     state.clear_auto_pending()
                     state.reset_alerts_for_current_level()
                     state.save()
                     last_state_save = now
                 elif state.pending_stale(args.pending_timeout):
                     pending = state.pending_action
-                    notifier.send_trade_notice(
-                        f"⚠️ 自动执行未确认: {pending}",
-                        [
-                            f"超过 {args.pending_timeout}s 后状态仍未达到预期。",
-                            "已解除 pending，下一次达到提醒间隔会重新评估/重试。",
-                            f"当前状态: {state.level_state}",
-                            f"方向: {state.direction_label}",
-                        ],
-                    )
+                    logger.warning(f"Clearing stale legacy pending action: {pending}")
                     state.clear_auto_pending()
                     state.save()
                     last_state_save = now
@@ -661,6 +1070,12 @@ def cmd_monitor(args):
                     continue
 
             # --- Grid threshold checks ---
+            if state.is_halted:
+                if now - last_state_save >= args.state_save_interval:
+                    state.save()
+                    last_state_save = now
+                continue
+
             ls = state.level_state
             acted = False
 
@@ -703,7 +1118,9 @@ def cmd_monitor(args):
                         details, args.asset, args.repeat_interval, price_marks
                     )
                 elif total_pnl <= thresholds["warning"] and should_send(state, "warning", args.repeat_interval):
-                    acted = send_and_mark(notifier, state, "warning", total_pnl, positions, "")
+                    logger.warning(f"Deep loss warning threshold reached: {total_pnl:+.2f} USDC")
+                    state.mark_alert("warning")
+                    acted = True
 
             if acted or now - last_state_save >= args.state_save_interval:
                 state.save()
@@ -723,6 +1140,9 @@ def cmd_status(args):
     print(f"Opened:    {d['opened_at'] or 'N/A'}")
     print(f"Last PnL:  {d['last_total_pnl']:+.2f}")
     print(f"Updated:   {d['last_update'] or 'N/A'}")
+    print(f"Halted:    {state.is_halted}")
+    if state.is_halted:
+        print(f"Reason:    {state.halt_reason or 'unknown'}")
     print(f"Alerts:    {d['alerts_sent']}")
 
 
@@ -731,6 +1151,15 @@ def cmd_reset_warning(args):
     state = GridState()
     state.reset_warning()
     print("Warning alert reset.")
+
+
+def cmd_resume(args):
+    from state import GridState
+    state = GridState()
+    state.clear_halt()
+    state.clear_auto_pending()
+    state.save()
+    print("Halt cleared. Restart monitor only after positions are manually verified.")
 
 
 def main():
@@ -757,6 +1186,9 @@ def main():
 
     p = sub.add_parser("reset-warning", help="Reset warning alert flag")
     p.set_defaults(func=cmd_reset_warning)
+
+    p = sub.add_parser("resume", help="Clear halted state after manual verification")
+    p.set_defaults(func=cmd_resume)
 
     args = parser.parse_args()
     if not args.command:
