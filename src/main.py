@@ -19,6 +19,12 @@ logger = logging.getLogger("GridMonitor")
 BTC_MARKET = "BTC-USD-PERP"
 ETH_MARKET = "ETH-USD-PERP"
 LEVEL_ORDER = ["L1", "L2", "L3"]
+ACTIVE_LEVELS = {
+    "FLAT": [],
+    "L1": ["L1"],
+    "L1_L2": ["L1", "L2"],
+    "L1_L2_L3": ["L1", "L2", "L3"],
+}
 STABLECOIN_TOKENS = {"USDC", "USDT", "DAI", "USDP", "TUSD"}
 
 
@@ -110,6 +116,162 @@ def position_map(positions):
     return {p.get("market"): p for p in positions}
 
 
+def position_side_for(market, direction):
+    if market == BTC_MARKET:
+        return "LONG" if direction == 1 else "SHORT"
+    if market == ETH_MARKET:
+        return "SHORT" if direction == 1 else "LONG"
+    return "UNKNOWN"
+
+
+def lot_level_for_action(action_key):
+    return {
+        "L1_TP": "L1",
+        "L1_open": "L1",
+        "L2_open": "L2",
+        "L2_close": "L2",
+        "L3_open": "L3",
+        "L3_close": "L3",
+    }.get(action_key)
+
+
+def market_size_tolerance(market):
+    return 0.000005 if market == BTC_MARKET else 0.00005
+
+
+def lot_has_both_markets(lot):
+    return bool(
+        lot
+        and lot.get(BTC_MARKET, {}).get("size")
+        and lot.get(ETH_MARKET, {}).get("size")
+    )
+
+
+def recorded_lot_snapshot(state, level):
+    if not state or not level:
+        return None
+    lots = state.lots
+    lot = lots.get(level)
+    if not lot_has_both_markets(lot):
+        return None
+    return {"source": "state", "lots": {level: lot}}
+
+
+def current_position_lot_snapshot(positions, direction):
+    lots = {"L1": {"direction": direction, "source": "positions"}}
+    pos_by_market = position_map(positions)
+    for market in (BTC_MARKET, ETH_MARKET):
+        pos = pos_by_market.get(market)
+        if not pos:
+            continue
+        size = abs(_to_float(pos.get("size")))
+        if size <= 0:
+            continue
+        lots["L1"][market] = {
+            "size": size,
+            "notional": abs(_to_float(pos.get("cost"))),
+            "entry": _to_float(pos.get("average_entry_price")),
+            "position_side": pos.get("side"),
+        }
+    return {"source": "positions", "lots": lots}
+
+
+def recorded_lots_issue(state, positions, level_state):
+    active_levels = ACTIVE_LEVELS.get(level_state, [])
+    lots = state.lots
+
+    if not active_levels:
+        return None
+
+    for level in active_levels:
+        if not lot_has_both_markets(lots.get(level)):
+            return f"missing recorded {level} lot"
+
+    pos_by_market = position_map(positions)
+    for market in (BTC_MARKET, ETH_MARKET):
+        pos = pos_by_market.get(market)
+        if not pos:
+            return f"missing {market} position while recorded lots are active"
+
+        current_size = abs(_to_float(pos.get("size")))
+        recorded_size = sum(
+            _to_float(lots.get(level, {}).get(market, {}).get("size"))
+            for level in active_levels
+        )
+        tol = market_size_tolerance(market)
+        if abs(current_size - recorded_size) > tol:
+            return (
+                f"{market} recorded lot total {format_size(recorded_size)} "
+                f"differs from current position {format_size(current_size)}"
+            )
+
+    return None
+
+
+def clamp_lot_snapshot_to_positions(lot_snapshot, positions, level):
+    if not lot_snapshot:
+        return lot_snapshot
+
+    pos_by_market = position_map(positions)
+    lots = {}
+    for lot_level, lot in lot_snapshot.get("lots", {}).items():
+        lots[lot_level] = dict(lot)
+        if lot_level != level:
+            continue
+        for market in (BTC_MARKET, ETH_MARKET):
+            if market not in lot:
+                continue
+            current_size = abs(_to_float(pos_by_market.get(market, {}).get("size")))
+            planned_size = abs(_to_float(lot.get(market, {}).get("size")))
+            capped_size = min(planned_size, current_size)
+            lots[lot_level][market] = dict(lot[market])
+            lots[lot_level][market]["size"] = capped_size
+            if capped_size < planned_size:
+                logger.warning(
+                    f"Clamped {lot_level} {market} close size from "
+                    f"{format_size(planned_size)} to {format_size(capped_size)}"
+                )
+
+    return {"source": lot_snapshot.get("source", "unknown"), "lots": lots}
+
+
+def record_lot_from_orders(state, level, direction, orders, statuses):
+    if not level:
+        return
+
+    lot = {
+        "direction": direction,
+        "opened_at": int(time.time() * 1000),
+        "source": "auto_order",
+    }
+    for order in orders:
+        status = statuses.get(order.client_id)
+        filled, _ = order_status_size(status)
+        if filled <= 0:
+            continue
+        lot[order.market] = {
+            "size": filled,
+            "notional": order_notional(status),
+            "entry": order_avg_price(status),
+            "order_side": "BUY" if order.order_side == OrderSide.Buy else "SELL",
+            "position_side": position_side_for(order.market, direction),
+            "client_id": order.client_id,
+        }
+
+    if lot_has_both_markets(lot):
+        state.set_lot(level, lot)
+
+
+def apply_lot_update_after_success(state, action_key, kind, action_direction, orders, statuses):
+    level = lot_level_for_action(action_key)
+    if not level:
+        return
+    if kind == "open":
+        record_lot_from_orders(state, level, action_direction or state.direction, orders, statuses)
+    elif kind == "close":
+        state.clear_lot(level)
+
+
 def current_round_start_at(positions):
     created = [
         _to_int(p.get("created_at"))
@@ -121,8 +283,20 @@ def current_round_start_at(positions):
     return max(0, min(created) - 120_000)
 
 
-def build_lot_snapshot(client, positions, level_state, direction):
-    """Return per-level BTC/ETH sizes, preferring actual fills over estimates."""
+def build_lot_snapshot(client, positions, level_state, direction, state=None):
+    """Return per-level BTC/ETH sizes.
+
+    Auto-managed lots recorded in state are authoritative. Fill reconstruction
+    remains only as a legacy fallback for alert-only/manual mode.
+    """
+    level = close_level_for_state(level_state)
+    recorded = recorded_lot_snapshot(state, level)
+    if recorded:
+        return clamp_lot_snapshot_to_positions(recorded, positions, level)
+
+    if level_state == "L1":
+        return current_position_lot_snapshot(positions, direction)
+
     fills = None
     start_at = current_round_start_at(positions)
     if start_at is not None:
@@ -130,9 +304,13 @@ def build_lot_snapshot(client, positions, level_state, direction):
 
     lots = reconstruct_lots_from_fills(positions, fills or [], direction)
     if has_lot_for_level(lots, close_level_for_state(level_state)):
-        return {"source": "fills", "lots": lots}
+        return clamp_lot_snapshot_to_positions({"source": "fills", "lots": lots}, positions, level)
 
-    return {"source": "estimated", "lots": estimate_lots_from_positions(positions, level_state)}
+    return clamp_lot_snapshot_to_positions(
+        {"source": "estimated", "lots": estimate_lots_from_positions(positions, level_state)},
+        positions,
+        level,
+    )
 
 
 def reconstruct_lots_from_fills(positions, fills, direction):
@@ -148,6 +326,11 @@ def reconstruct_lots_from_fills(positions, fills, direction):
             if fill.get("market") != market:
                 continue
             if fill.get("side") != open_side:
+                continue
+            client_id = fill.get("client_id") or ""
+            if "-close" in client_id or client_id.startswith("halt-flatten"):
+                continue
+            if client_id and "-open-" not in client_id and not client_id.startswith("initial-L1"):
                 continue
             # Paradex position.created_at can be a few milliseconds after the fill.
             if position_created_at and _to_int(fill.get("created_at")) < position_created_at - 5000:
@@ -456,7 +639,13 @@ def build_close_details(alert_type, lot_snapshot, state, asset_size):
     lot = lot_snapshot["lots"].get(level, {})
     btc_size = lot.get(BTC_MARKET, {}).get("size", 0.0)
     eth_size = lot.get(ETH_MARKET, {}).get("size", 0.0)
-    source = "fills 反推" if lot_snapshot["source"] == "fills" else "按当前仓位比例估算"
+    source_names = {
+        "state": "机器人记录",
+        "positions": "当前持仓",
+        "fills": "历史成交回退",
+        "estimated": "按当前仓位比例估算",
+    }
+    source = source_names.get(lot_snapshot["source"], lot_snapshot["source"])
 
     btc_action = "卖出" if state.direction == 1 else "买入"
     eth_action = "买入" if state.direction == 1 else "卖出"
@@ -736,7 +925,10 @@ def flatten_all_positions(trader, client, reason):
     }
 
 
-def submit_order_set_checked(trader, notifier, state, client, action_key, kind, total_pnl, orders, asset_size, direction_label):
+def submit_order_set_checked(
+    trader, notifier, state, client, action_key, kind, total_pnl, orders,
+    asset_size, direction_label, action_direction=None
+):
     try:
         trader.submit_batch(orders)
     except Exception as e:
@@ -795,6 +987,7 @@ def submit_order_set_checked(trader, notifier, state, client, action_key, kind, 
     time.sleep(2)
     post_positions = client.get_open_positions() or []
     sync_state_from_positions(state, post_positions, asset_size)
+    apply_lot_update_after_success(state, action_key, kind, action_direction, orders, statuses)
     send_operation_notice(
         notifier,
         operation_title(action_key, kind, success=True),
@@ -827,7 +1020,7 @@ def submit_l1_take_profit(trader, notifier, state, client, total_pnl, positions,
 
     close_ok, close_positions = submit_order_set_checked(
         trader, notifier, state, client, "L1_TP", "close", total_pnl,
-        close_orders, asset_size, direction_label_for(old_direction)
+        close_orders, asset_size, direction_label_for(old_direction), old_direction
     )
     if not close_ok or state.is_halted:
         return True
@@ -852,7 +1045,7 @@ def submit_l1_take_profit(trader, notifier, state, client, total_pnl, positions,
 
     submit_order_set_checked(
         trader, notifier, state, client, "L1_open", "open", total_pnl,
-        open_orders, asset_size, direction_label_for(-old_direction)
+        open_orders, asset_size, direction_label_for(-old_direction), -old_direction
     )
     return True
 
@@ -875,7 +1068,7 @@ def submit_auto_action(trader, notifier, state, action_key, total_pnl, positions
 
     submit_order_set_checked(
         trader, notifier, state, client, action_key, kind, total_pnl,
-        orders, asset_size, state.direction_label
+        orders, asset_size, state.direction_label, state.direction
     )
     return True
 
@@ -885,7 +1078,7 @@ def act_or_alert(trader, notifier, state, client, action_key, total_pnl, positio
         return False
 
     needs_lot = action_key in {"L1_TP", "L2_close", "L3_close"}
-    lot_snapshot = build_lot_snapshot(client, positions, state.level_state, state.direction) if needs_lot else {
+    lot_snapshot = build_lot_snapshot(client, positions, state.level_state, state.direction, state) if needs_lot else {
         "source": "not_required",
         "lots": {},
     }
@@ -1022,6 +1215,30 @@ def cmd_monitor(args):
                     if detected_dir != 0 and detected_dir != state.direction:
                         state.data["direction"] = detected_dir
 
+                    lots_issue = recorded_lots_issue(state, positions, state.level_state)
+                    if trader.enabled and not trader.dry_run and not state.is_halted and lots_issue:
+                        logger.error(f"Recorded lot integrity issue: {lots_issue}")
+                        state.halt("recorded_lots", lots_issue)
+                        notifier.send_trade_notice(
+                            operation_title("recorded_lots", "close", success=False),
+                            [
+                                f"方向: {state.direction_label}",
+                                f"触发: REST PnL {rest_total_pnl:+.2f} USDC",
+                                "",
+                                "本次平仓:",
+                                "未提交订单",
+                                "",
+                                "处理:",
+                                f"记录仓位与真实持仓不一致: {lots_issue}",
+                                "机器人已暂停，等待人工确认。",
+                                "",
+                                "当前剩余仓位:",
+                                *summarize_positions(positions),
+                            ],
+                        )
+                        state.save()
+                        continue
+
             if positions is None:
                 continue
 
@@ -1081,7 +1298,7 @@ def cmd_monitor(args):
 
             if ls == "L1":
                 if total_pnl >= thresholds["L1_TP"]:
-                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
+                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction, state)
                     details = build_close_details("L1_TP", lot_snapshot, state, args.asset)
                     acted = act_or_alert(
                         trader, notifier, state, client, "L1_TP", total_pnl, positions,
@@ -1096,7 +1313,7 @@ def cmd_monitor(args):
 
             elif ls == "L1_L2":
                 if total_pnl >= thresholds["L2_close"]:
-                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
+                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction, state)
                     details = build_close_details("L2_close", lot_snapshot, state, args.asset)
                     acted = act_or_alert(
                         trader, notifier, state, client, "L2_close", total_pnl, positions,
@@ -1111,7 +1328,7 @@ def cmd_monitor(args):
 
             elif ls == "L1_L2_L3":
                 if total_pnl >= thresholds["L3_close"]:
-                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction)
+                    lot_snapshot = build_lot_snapshot(client, positions, ls, state.direction, state)
                     details = build_close_details("L3_close", lot_snapshot, state, args.asset)
                     acted = act_or_alert(
                         trader, notifier, state, client, "L3_close", total_pnl, positions,
@@ -1143,6 +1360,7 @@ def cmd_status(args):
     print(f"Halted:    {state.is_halted}")
     if state.is_halted:
         print(f"Reason:    {state.halt_reason or 'unknown'}")
+    print(f"Lots:      {list(state.lots.keys())}")
     print(f"Alerts:    {d['alerts_sent']}")
 
 

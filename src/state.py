@@ -31,6 +31,7 @@ DEFAULT_STATE = {
         "action": None,
         "started_at": None
     },
+    "lots": {},
     "stablecoin_transfers": {
         "initialized": False,
         "seen": {}
@@ -53,6 +54,7 @@ class GridState:
             data.setdefault("alerts_sent", copy.deepcopy(DEFAULT_STATE["alerts_sent"]))
             data.setdefault("auto_trade", copy.deepcopy(DEFAULT_STATE["auto_trade"]))
             data.setdefault("halted", copy.deepcopy(DEFAULT_STATE["halted"]))
+            data.setdefault("lots", copy.deepcopy(DEFAULT_STATE["lots"]))
             data.setdefault("stablecoin_transfers", copy.deepcopy(DEFAULT_STATE["stablecoin_transfers"]))
             data["stablecoin_transfers"].setdefault("initialized", False)
             data["stablecoin_transfers"].setdefault("seen", {})
@@ -133,6 +135,19 @@ class GridState:
     def clear_halt(self):
         self.data["halted"] = copy.deepcopy(DEFAULT_STATE["halted"])
 
+    @property
+    def lots(self):
+        return self.data.setdefault("lots", {})
+
+    def set_lot(self, level, lot):
+        self.data.setdefault("lots", {})[level] = lot
+
+    def clear_lot(self, level):
+        self.data.setdefault("lots", {}).pop(level, None)
+
+    def clear_lots(self):
+        self.data["lots"] = {}
+
     def mark_auto_pending(self, action, expected_level, expected_direction, client_ids):
         self.data["auto_trade"] = {
             "pending_action": action,
@@ -209,6 +224,8 @@ class GridState:
         self.data["level_state"] = new_level
         if new_dir != 0:
             self.data["direction"] = new_dir
+        if new_level == "FLAT":
+            self.clear_lots()
 
         # Entering a new level from FLAT means fresh start
         if old == "FLAT" and new_level != "FLAT":

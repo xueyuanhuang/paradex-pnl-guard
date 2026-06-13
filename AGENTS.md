@@ -42,8 +42,11 @@ The bot does not automatically stop loss. Deep loss is logged but does not send 
 
 When auto trading is enabled, the bot submits standard Paradex API market orders:
 
-- Close actions are reduce-only and use the actual lot size when fills can reconstruct it.
+- Close actions are reduce-only and use the recorded auto-opened lot size.
 - Open actions are specified by target notional; the bot converts notional to quantity using current price marks.
+- Auto-opened L1/L2/L3 lots are recorded in `state.json` under `lots`. Close actions use these recorded lot sizes instead of reconstructing lots from fills.
+- Before any reduce-only close, the planned close quantity is capped by the current actual BTC/ETH position size to avoid reduce-only orders that would flip the position.
+- If recorded lots are missing or their total BTC/ETH size differs from the current actual position, the bot halts instead of guessing from trade history.
 - Paradex batch orders are not treated as atomic. After every submission, the bot fetches order history by client id and verifies each BTC/ETH leg is fully filled.
 - `L1_TP` is executed in two phases: close old L1 first, verify fills, then open the new reverse L1. Closing and reopening must not be submitted in the same batch.
 - If any leg is missing, partially filled, cancelled, or absent from order history, the bot attempts reduce-only flattening of all remaining BTC/ETH positions, sets `halted.active = true`, and stops all further threshold trading until `resume` is run after manual verification.
@@ -110,6 +113,19 @@ The mitigation is now:
 - flatten all remaining BTC/ETH exposure on any leg failure,
 - halt the bot until manual verification,
 - execute L1 close and reverse-open in separate verified phases.
+
+## 2026-06-12 Incident
+
+At `2026-06-12 15:10 UTC`, an `L1_TP` close attempted to reduce-only close the previous L1 sizes (`BTC 0.01622`, `ETH 0.4194`) while the current L1 sizes were smaller (`BTC 0.0158`, `ETH 0.3934`). Paradex rejected both close orders with `REDUCE_ONLY_WILL_INCREASE`. The protective flattening path then used the actual current position sizes and successfully flattened the account.
+
+Root cause: after an L1 take-profit reversal, the old close fills and new open fills have the same BUY/SELL side. The legacy fill-reconstruction logic matched by side and could mistake the old close fills for the current L1 open fills.
+
+The mitigation is now:
+
+- auto-opened L1/L2/L3 lots are stored in `state.json`,
+- close actions use recorded lots rather than fill reconstruction,
+- reduce-only close quantities are capped to current actual position size,
+- missing or mismatched recorded lots halt the bot instead of guessing.
 
 ## Maintenance Rules
 

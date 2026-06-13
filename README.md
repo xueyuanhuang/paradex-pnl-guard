@@ -25,6 +25,8 @@ venv/bin/python src/main.py monitor --repeat-interval 600 --pending-timeout 180
 - Paradex `SystemState` must be `ok` before any live auto order.
 - REST position PnL is the only strategy trigger source; default polling is every 5 seconds.
 - WebSocket BBO is diagnostics-only and does not trigger strategy actions.
+- Auto-opened L1/L2/L3 lot sizes are recorded in `state.json`; close actions use recorded lots rather than guessing from fills.
+- Reduce-only close quantities are capped to the current actual position size.
 - Every submitted BTC/ETH leg is verified from order history. If any leg fails or partially fills, the bot attempts reduce-only flattening, halts, and waits for manual resume.
 
 ## Basic Commands
